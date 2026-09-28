@@ -132,14 +132,51 @@ impl Harness for SymphonyHarness {
     fn deterministic_turn_end(&self) -> bool {
         true
     }
-    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-        Ok(vec![Model {
+    fn fallback_models(&self) -> Vec<Model> {
+        vec![Model {
             id: "default".into(),
             label: "Symphony default".into(),
             description: Some("Uses the model configured in Symphony".into()),
             reasoning_levels: vec![],
             options: vec![],
-        }])
+        }]
+    }
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        let exe =
+            Self::executable().ok_or_else(|| HarnessError::NotInstalled("symphony".into()))?;
+        let mut command = Command::new(&exe);
+        command.args(["stdio", "--models"]);
+        crate::compose_child_path(&mut command, &exe);
+        let output = command.output().await?;
+        let frame: Value = serde_json::from_slice(&output.stdout)
+            .map_err(|err| HarnessError::Protocol(format!("Symphony model catalog: {err}")))?;
+        if !output.status.success() {
+            return Err(HarnessError::Protocol(field(&frame, "message").into()));
+        }
+        let models = frame["models"]
+            .as_array()
+            .ok_or_else(|| HarnessError::Protocol("Symphony did not return a model list".into()))?;
+        Ok(models
+            .iter()
+            .filter_map(|item| {
+                let id = item["id"].as_str()?;
+                let reasoning_levels = item["reasoning_levels"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|level| {
+                        serde_json::from_value::<ReasoningLevel>(level.clone()).ok()
+                    })
+                    .collect();
+                Some(Model {
+                    id: id.into(),
+                    label: field(item, "label").into(),
+                    description: Some(field(item, "description").into()),
+                    reasoning_levels,
+                    options: vec![],
+                })
+            })
+            .collect())
     }
 
     async fn run(
