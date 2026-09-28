@@ -255,7 +255,7 @@ impl Harness for SymphonyHarness {
                             assistant_message_id: uuid::Uuid::new_v4().to_string(),
                         }));
                         let line =
-                            json!({"type":"run", "prompt":request.prompt}).to_string() + "\n";
+                            json!({"type":"run", "prompt":request.prompt, "attachments":request.attachments}).to_string() + "\n";
                         if stdin.write_all(line.as_bytes()).await.is_err() {
                             break;
                         }

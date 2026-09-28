@@ -26,5 +26,5 @@ Each Zeron prompt starts a Symphony subprocess. Symphony's session ID is
 stored with the Zeron chat so later prompts resume its JSONL checkpoint.
 The model picker lists models from Symphony's configured providers. Approval questions and `ask_user` are handled
 through Zeron's input panel. This driver does not yet map Symphony's child
-agent tree, plan widgets, attachments, or live steering into
+agent tree, plan widgets, or live steering into
 specialized Zeron views. Those events remain in Symphony's own persistence.
