@@ -196,6 +196,9 @@ impl Harness for SymphonyHarness {
                 command.arg("--model").arg(model);
             }
         }
+        if request.auto_approve {
+            command.arg("--unattended");
+        }
         command
             .current_dir(&request.cwd)
             .stdin(Stdio::piped())
