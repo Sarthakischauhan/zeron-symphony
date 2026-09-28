@@ -112,6 +112,7 @@ pub fn cli_name(harness: HarnessId) -> &'static str {
         HarnessId::Pi => "pi",
         HarnessId::Opencode => "opencode",
         HarnessId::Antigravity => "Antigravity",
+        HarnessId::Symphony => "symphony",
         HarnessId::Mock => "mock",
     }
 }
@@ -871,6 +872,12 @@ impl HarnessesPage {
                         div()
                             .text_color(theme.text_muted.opacity(0.65))
                             .child("pi-acp bridge · Managed by Zeron")
+                            .into_any_element(),
+                    ),
+                    HarnessId::Symphony => meta.push(
+                        div()
+                            .text_color(theme.text_muted.opacity(0.65))
+                            .child("Symphony approvals apply · Zeron sandbox is not enforced")
                             .into_any_element(),
                     ),
                     _ => {}

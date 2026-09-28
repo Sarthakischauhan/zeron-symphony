@@ -529,6 +529,20 @@ pub fn default_registry() -> HarnessRegistry {
     // claude/codex resolve doesn't pay the shell-startup latency inline.
     zeron_harness::shell_env::prewarm();
     let registry = HarnessRegistry::new();
+    registry.register_lazy(
+        HarnessDescriptor {
+            id: HarnessId::Symphony,
+            name: "Symphony".into(),
+            supports_steering: false,
+            steering_mode: SteeringMode::TurnBoundary,
+            reasoning_levels: Vec::new(),
+            installed: true,
+            can_install: false,
+            enabled: None,
+        },
+        Box::new(|| zeron_harness::SymphonyHarness::new().installed()),
+        Box::new(|| Ok(Arc::new(zeron_harness::SymphonyHarness::new()) as Arc<dyn Harness>)),
+    );
     registry.register(Arc::new(MockHarness {
         script: vec![
             AgentEvent::TextDelta {
