@@ -258,7 +258,7 @@ fn main() -> anyhow::Result<()> {
                 workos_client_id: workos_client_id_from_env(&edge_token),
                 edge_token,
                 org_id: std::env::var("ZERON_ORG_ID").ok(),
-                default_harness: zeron_ui::HarnessId::ClaudeCode,
+                default_harness: zeron_ui::HarnessId::Symphony,
                 initial_url: cli.open_url,
             });
             Ok(())
@@ -316,18 +316,11 @@ fn engine_config_from_env() -> zeron_engine::EngineConfig {
 }
 
 /// `ZERON_HARNESS` (kebab-case id) picks the default harness for chats without a
-/// config row — `mock` powers the e2e smoke; default `claude-code`.
+/// config row — `mock` powers the e2e smoke; otherwise this fork uses Symphony.
 fn harness_from_env() -> zeron_engine::HarnessId {
     match std::env::var("ZERON_HARNESS").as_deref().map(str::trim) {
         Ok("mock") => zeron_engine::HarnessId::Mock,
-        Ok("codex") => zeron_engine::HarnessId::Codex,
-        Ok("cursor") => zeron_engine::HarnessId::Cursor,
-        Ok("devin") => zeron_engine::HarnessId::Devin,
-        Ok("grok") => zeron_engine::HarnessId::Grok,
-        Ok("hermes") => zeron_engine::HarnessId::Hermes,
-        Ok("pi") => zeron_engine::HarnessId::Pi,
-        Ok("antigravity") => zeron_engine::HarnessId::Antigravity,
-        _ => zeron_engine::HarnessId::ClaudeCode,
+        _ => zeron_engine::HarnessId::Symphony,
     }
 }
 

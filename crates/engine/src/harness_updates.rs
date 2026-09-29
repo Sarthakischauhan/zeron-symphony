@@ -249,6 +249,12 @@ fn provider(id: HarnessId) -> ProviderSpec {
             update_args: None,
             manual_command: "",
         },
+        HarnessId::Symphony => ProviderSpec {
+            version_args: &["--version"],
+            latest: LatestSource::Manual,
+            update_args: None,
+            manual_command: "Update symphony-code in its Python environment",
+        },
     }
 }
 

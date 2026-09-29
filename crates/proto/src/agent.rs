@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 pub enum HarnessId {
     ClaudeCode,
     Codex,
+    /// Symphony coding agent, driven through its interactive JSONL subprocess.
+    Symphony,
     Cursor,
     /// Cognition's Devin agent, driven over ACP (`devin acp`).
     Devin,

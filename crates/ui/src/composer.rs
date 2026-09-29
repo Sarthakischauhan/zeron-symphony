@@ -8166,7 +8166,11 @@ impl Composer {
                         reasoning: resolved.reasoning,
                         model_options: resolved.model_options.clone(),
                         cwd,
-                        sandbox: SandboxLevel::WorkspaceWrite,
+                        sandbox: if resolved.harness == Some(HarnessId::Symphony) {
+                            SandboxLevel::DangerFullAccess
+                        } else {
+                            SandboxLevel::WorkspaceWrite
+                        },
                         auto_approve: false,
                         resume: None,
                         attachments: attachment_paths,

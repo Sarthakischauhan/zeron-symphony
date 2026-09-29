@@ -1,62 +1,37 @@
-# Zeron
+# Zeron Symphony
 
-在本地管理你的编码 agent（Claude Code、Codex、Cursor、Grok、Hermes、Pi、Antigravity），也可以打开多设备同步。
+Zeron 的桌面界面，使用 [Symphony 编码 Agent](https://github.com/Sarthakischauhan/symphony) 作为运行引擎。Zeron 提供工作区、聊天和 Agent 界面；Symphony 负责运行模型和工具。
 
 *[English](README.md) | 简体中文*
 
-![Zeron 驱动一个 Claude Code 会话，侧边栏是实时的分支 diff](apps/landing/public/assets/app-screenshot.jpg)
+![Zeron 桌面截图，展示正在进行的编码会话](apps/landing/public/assets/app-screenshot.jpg)
 
-每台设备各跑一个小引擎，会话就存在这台设备上。装完默认是纯本地模式，不用账号，也不用联网。
+## 从源码安装
 
-## 在本地安装运行（Linux）
+需要 Python 3.11+、[uv](https://docs.astral.sh/uv/) 和稳定版 Rust 工具链。启动 Zeron 前，请先在 Symphony 中配置至少一个模型提供商。
 
-```bash
-curl -fsSL https://zeron.sh/install.sh | sh
-zeron status
-```
-
-安装脚本会马上把守护进程拉起来，重启之后也会自己回来。不需要登录，也不需要配置同步。
-
-日常命令：
+将两个功能分支克隆到同一目录下：
 
 ```bash
-zeron status      # 查看本地/同步模式和引擎状态
-zeron update      # 更新到最新版本
-zeron daemon start|stop|restart|status
+git clone --branch feat/symphony-provider https://github.com/Sarthakischauhan/zeron-symphony.git
+git clone --branch feat/zeron-stdio-agent https://github.com/Sarthakischauhan/symphony.git
 ```
 
-## 可选：多设备同步
-
-只有想打开账号下的同步工作区时才需要登录。登录会换掉引擎下次启动时用的 profile，所以改之前先停掉守护进程：
+安装 Symphony 并构建 Zeron：
 
 ```bash
-zeron daemon stop
-zeron login
-zeron daemon start
+cd symphony
+uv sync --all-packages
+cd ../zeron-symphony
+export SYMPHONY_EXECUTABLE="$(cd ../symphony && pwd)/.venv/bin/symphony"
+cargo build --release --locked -p zeron
+./target/release/zeron
 ```
 
-之后就可以在一台同步过的设备上起 agent，换另一台设备接着看、接着操作。一台常开的机器，比如 VPS，可以在你合上笔记本之后继续跑这些 agent。
+请在启动 Zeron 的环境中设置模型提供商凭据。例如，Symphony 支持 `OPENAI_API_KEY`。更多配置、模型发现和当前集成限制，请参阅 [Symphony 安装指南](docs/symphony.md)。
 
-登录不会上传、搬走或导入已有的本地会话。本地会话和它们的附件仍然留在本地 profile 下，切回纯本地模式时会照常出现：
+Linux 需要安装 GPUI 的系统构建依赖。应用内浏览器还需要 [WebKitGTK 4.1 和 JSON-GLib](docs/reference/linux-browser.md)。
 
-```bash
-zeron daemon stop
-zeron logout
-zeron daemon start
-```
+## 许可证
 
-如果有引擎正占着数据目录，`zeron login` 和 `zeron logout` 会拒绝改动凭据。桌面应用同样遵守这条边界：profile 要等下次重启才切换。
-
-macOS 上用桌面版发行包，或者从源码构建 `zeron`，再运行 `zeron daemon install` 装上 launchd 服务。
-
-## 赞助
-
-感谢 [The Context Company](https://www.thecontextcompany.com/) 对 Zeron 的赞助。
-
-你也可以资助 Zeron 的开发。欢迎个人和公司[通过 GitHub 成为赞助者](https://github.com/sponsors/zeronsh)。
-
----
-
-想参与开发，或者好奇它怎么跑起来的？[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/zeronsh/zeron)，也可以看 [ARCHITECTURE.md](ARCHITECTURE.md)。
-
-采用 [MIT License](LICENSE)。
+[MIT](LICENSE)

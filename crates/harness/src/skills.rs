@@ -40,9 +40,35 @@ impl CommandDiscovery {
     }
 }
 
+fn symphony_home() -> Option<PathBuf> {
+    let executable = std::env::var_os("SYMPHONY_EXECUTABLE")
+        .and_then(|path| crate::executable::validate_native_override(Path::new(&path)).ok())
+        .or_else(|| crate::executable::find_on_paths("symphony", Vec::new()))?;
+    if let Some(root) = std::env::var_os("SYMPHONY_ROOT") {
+        let root = PathBuf::from(root);
+        if root.join(".symphony/config.json").is_file() {
+            return Some(root);
+        }
+    }
+    executable.ancestors().find_map(|candidate| {
+        candidate
+            .join(".symphony/config.json")
+            .is_file()
+            .then(|| candidate.to_path_buf())
+    })
+}
+
 pub(crate) async fn discover(harness: HarnessId, cwd: &Path) -> Result<Vec<Skill>, HarnessError> {
     let cwd = cwd.to_path_buf();
-    let home = crate::executable::home_or_current_dir();
+    // Symphony resolves its global skills and plugins relative to the home it
+    // uses for the child process, which is the checkout containing its config.
+    // Use that same home here so the picker and the actual agent see the same
+    // catalog. Other harnesses retain the host home directory behavior.
+    let home = if harness == HarnessId::Symphony {
+        symphony_home().unwrap_or_else(crate::executable::home_or_current_dir)
+    } else {
+        crate::executable::home_or_current_dir()
+    };
     tokio::task::spawn_blocking(move || discover_at(harness, &cwd, &home))
         .await
         .map_err(|error| HarnessError::Protocol(error.to_string()))?
@@ -120,6 +146,7 @@ fn project_dirs(harness: HarnessId) -> &'static [&'static str] {
         HarnessId::Pi => &[".agents/skills", ".pi/skills"],
         HarnessId::Devin => &[".agents/skills"],
         HarnessId::Antigravity => &[".agents/skills", ".gemini/skills"],
+        HarnessId::Symphony => &[".symphony/skills"],
         HarnessId::Codex => &[".agents/skills", ".codex/skills"],
         HarnessId::Mock => &[],
     }
