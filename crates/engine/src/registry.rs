@@ -521,14 +521,28 @@ impl HarnessRegistry {
     }
 }
 
-/// The production registry: MockHarness (hidden from production pickers) plus a lazy
-/// `claude-code` slot resolved through `zeron_harness` on first use (subprocess
-/// discovery only happens when a run/model call actually needs it).
-pub fn default_registry() -> HarnessRegistry {
-    // Warm the login-shell PATH snapshot in the background so the first
-    // claude/codex resolve doesn't pay the shell-startup latency inline.
-    zeron_harness::shell_env::prewarm();
+/// The Symphony app only advertises the runtime it can execute. Keeping this
+/// separate from the general registry preserves the original test rigs.
+pub fn symphony_registry() -> HarnessRegistry {
     let registry = HarnessRegistry::new();
+    register_symphony(&registry);
+    registry
+}
+
+#[cfg(test)]
+mod symphony_registry_tests {
+    use super::*;
+
+    #[test]
+    fn only_symphony_is_available() {
+        let registry = symphony_registry();
+        assert_eq!(registry.descriptors().len(), 1);
+        assert_eq!(registry.descriptors()[0].id, HarnessId::Symphony);
+        assert!(registry.resolve(HarnessId::ClaudeCode).is_err());
+    }
+}
+
+fn register_symphony(registry: &HarnessRegistry) {
     registry.register_lazy(
         HarnessDescriptor {
             id: HarnessId::Symphony,
@@ -543,6 +557,17 @@ pub fn default_registry() -> HarnessRegistry {
         Box::new(|| zeron_harness::SymphonyHarness::new().installed()),
         Box::new(|| Ok(Arc::new(zeron_harness::SymphonyHarness::new()) as Arc<dyn Harness>)),
     );
+}
+
+/// The production registry: MockHarness (hidden from production pickers) plus a lazy
+/// `claude-code` slot resolved through `zeron_harness` on first use (subprocess
+/// discovery only happens when a run/model call actually needs it).
+pub fn default_registry() -> HarnessRegistry {
+    // Warm the login-shell PATH snapshot in the background so the first
+    // claude/codex resolve doesn't pay the shell-startup latency inline.
+    zeron_harness::shell_env::prewarm();
+    let registry = HarnessRegistry::new();
+    register_symphony(&registry);
     registry.register(Arc::new(MockHarness {
         script: vec![
             AgentEvent::TextDelta {

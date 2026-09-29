@@ -779,17 +779,22 @@ impl Engine {
         });
 
         let preview_org = profile.org_id().to_string();
+        let registry = if config.default_harness == HarnessId::Symphony {
+            Arc::new(registry::symphony_registry())
+        } else {
+            Arc::new(default_registry())
+        };
         let core = match lock {
             Some(lock) => EngineCore::assemble_with_profile_locked(
                 profile,
-                Arc::new(default_registry()),
+                registry.clone(),
                 config.default_harness,
                 edge.clone(),
                 lock,
             )?,
             None => EngineCore::assemble_with_profile(
                 profile,
-                Arc::new(default_registry()),
+                registry,
                 config.default_harness,
                 edge.clone(),
             )?,

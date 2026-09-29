@@ -149,7 +149,12 @@ impl ResolvedRunConfig {
             model: self.model.clone(),
             reasoning: self.reasoning,
             model_options: self.model_options.clone(),
-            sandbox: SandboxLevel::WorkspaceWrite,
+            // Symphony does not provide Zeron's workspace-write sandbox.
+            sandbox: if self.harness == Some(HarnessId::Symphony) {
+                SandboxLevel::DangerFullAccess
+            } else {
+                SandboxLevel::WorkspaceWrite
+            },
         })
     }
 }
