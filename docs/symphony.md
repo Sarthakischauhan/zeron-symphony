@@ -26,7 +26,12 @@ that label does not provide filesystem isolation for Symphony sessions.
 
 Each Zeron prompt starts a Symphony subprocess. Symphony's session ID is
 stored with the Zeron chat so later prompts resume its JSONL checkpoint.
-The model picker lists models from Symphony's configured providers. Approval questions and `ask_user` are handled
+The model picker lists models from Symphony's configured providers. Symphony's
+`--models` response includes a qualified ID, display label, provider,
+context limit, and reasoning levels. The model rows and selected model chip
+show provider marks for OpenAI, Anthropic, Gemini, and Grok; other namespaces
+use the Symphony mark. The harness rail always uses the Symphony mark. Zeron
+does not yet display the context limit. Approval questions and `ask_user` are handled
 through Zeron's input panel. Zeron's auto-approve option selects Symphony's
 unattended policy, including its deny rules. Symphony child-agent activity
 is routed to Zeron's existing spawn cards and subagent transcript tabs using

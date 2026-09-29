@@ -217,6 +217,7 @@ icon_assets![
     (CURSOR_MARK, "cursor-mark"),
     (DEVIN_MARK, "devin-mark"),
     (GROK_MARK, "grok-mark"),
+    (GEMINI_MARK, "gemini-mark"),
     (HERMES_MARK, "hermes-mark"),
     (PI_MARK, "pi-mark"),
     (SYMPHONY_MARK, "symphony-mark"),

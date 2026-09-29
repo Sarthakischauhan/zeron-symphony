@@ -3938,7 +3938,7 @@ impl Pickers {
                 == Some(row.model.id.as_str());
         let is_active = ix == self.active;
         let is_fav = self.defaults.is_favorite(row.harness, &row.model.id);
-        let (icon_path, tint) = harness_brand_icon(row.harness);
+        let (icon_path, tint) = model_brand_icon(row.harness, &row.model.id);
         let label: SharedString = row.model.label.clone().into();
         let harness_name = row.harness_name.clone();
         let harness = row.harness;
@@ -5147,6 +5147,28 @@ pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gp
     }
 }
 
+/// Symphony qualifies each model ID with the API provider namespace. Keep the
+/// Symphony mark for the harness rail, but show the model's provider in rows
+/// and the selected chip. Gateways and unknown providers retain the harness
+/// mark: an upstream model name does not identify the API provider.
+fn model_brand_icon(harness: HarnessId, model_id: &str) -> (&'static str, Option<gpui::Hsla>) {
+    if harness == HarnessId::Symphony {
+        match model_id.split_once(':').map(|(provider, _)| provider) {
+            Some("openai") => return (crate::icons::OPENAI_MARK, None),
+            Some("anthropic") => {
+                return (
+                    crate::icons::CLAUDE_MARK,
+                    Some(crate::icons::claude_brand()),
+                );
+            }
+            Some("gemini") => return (crate::icons::GEMINI_MARK, None),
+            Some("grok") => return (crate::icons::GROK_MARK, None),
+            _ => {}
+        }
+    }
+    harness_brand_icon(harness)
+}
+
 /// `ZERON_HARNESS=mock` (the e2e/dev rig) opts the mock harness into the UI;
 /// production launches never set it, so the mock never surfaces there.
 fn mock_harness_enabled() -> bool {
@@ -5400,8 +5422,15 @@ impl Render for Pickers {
             Some(title) => title.harness,
             None => self.effective_harness(cx),
         };
+        let chip_model_id = self
+            .title
+            .as_ref()
+            .and_then(|title| title.model.as_deref())
+            .or_else(|| self.effective_model_id(cx));
         let harness_icon: (&'static str, Option<gpui::Hsla>) = match chip_harness {
-            Some(harness) => harness_brand_icon(harness),
+            Some(harness) => chip_model_id
+                .map(|id| model_brand_icon(harness, id))
+                .unwrap_or_else(|| harness_brand_icon(harness)),
             None if self.title.is_some() => (crate::icons::CHAT_ROUND_LINE, Some(theme.text_muted)),
             None if no_agents => (crate::icons::TERMINAL, Some(theme.text_muted)),
             None => (
@@ -5483,6 +5512,17 @@ impl Render for Pickers {
 mod tests {
     use super::*;
     use zeron_proto::{FolderEntry, Model, ModelOption, ModelOptionChoice};
+
+    #[test]
+    fn symphony_models_use_provider_marks() {
+        let icon = |id| model_brand_icon(HarnessId::Symphony, id).0;
+        assert_eq!(icon("openai:gpt-5.6"), crate::icons::OPENAI_MARK);
+        assert_eq!(icon("anthropic:claude-sonnet-4-6"), crate::icons::CLAUDE_MARK);
+        assert_eq!(icon("gemini:gemini-3.1-pro"), crate::icons::GEMINI_MARK);
+        assert_eq!(icon("grok:grok-4"), crate::icons::GROK_MARK);
+        assert_eq!(icon("openrouter:anthropic/claude-sonnet-4-6"), crate::icons::SYMPHONY_MARK);
+        assert_eq!(icon("default"), crate::icons::SYMPHONY_MARK);
+    }
 
     struct ModelShortcutHost {
         focus_sub: Option<gpui::Subscription>,
