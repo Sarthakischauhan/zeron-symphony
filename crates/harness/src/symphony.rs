@@ -34,6 +34,29 @@ impl SymphonyHarness {
         }
         crate::executable::find_on_paths("symphony", Vec::new())
     }
+
+    /// Return the checkout that owns the Symphony executable, when it has a
+    /// project-local `.symphony/config.json`. Symphony resolves its config
+    /// from `Path.home()`, so the child needs the checkout as its home rather
+    /// than Zeron's workspace (which is usually a different repository).
+    fn root(executable: &std::path::Path) -> Option<std::path::PathBuf> {
+        if let Some(root) = std::env::var_os("SYMPHONY_ROOT") {
+            let root = std::path::PathBuf::from(root);
+            return root.join(".symphony/config.json").is_file().then_some(root);
+        }
+        executable.ancestors().find_map(|candidate| {
+            candidate
+                .join(".symphony/config.json")
+                .is_file()
+                .then(|| candidate.to_path_buf())
+        })
+    }
+
+    fn configure(command: &mut Command, executable: &std::path::Path) {
+        if let Some(root) = Self::root(executable) {
+            command.env("HOME", &root).env("USERPROFILE", &root);
+        }
+    }
 }
 
 impl Default for SymphonyHarness {
@@ -282,6 +305,7 @@ impl Harness for SymphonyHarness {
             Self::executable().ok_or_else(|| HarnessError::NotInstalled("symphony".into()))?;
         let mut command = Command::new(&exe);
         command.arg("stdio");
+        Self::configure(&mut command, &exe);
         crate::compose_child_path(&mut command, &exe);
         command
             .stdin(Stdio::piped())
@@ -352,6 +376,7 @@ impl Harness for SymphonyHarness {
         if request.auto_approve {
             command.arg("--unattended");
         }
+        Self::configure(&mut command, &exe);
         command
             .current_dir(&request.cwd)
             .stdin(Stdio::piped())
