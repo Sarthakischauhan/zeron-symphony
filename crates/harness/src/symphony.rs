@@ -11,7 +11,7 @@ use tokio::{
 };
 use zeron_proto::{
     AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SlashCommand,
-    SteeringMode, ToolCall,
+    SteeringMode, ToolCall, ToolDiff,
     UserInputQuestion,
 };
 
@@ -130,6 +130,7 @@ fn tool_call(name: &str, args: &Value) -> ToolCall {
 struct SubagentMapper {
     paths: HashMap<String, Vec<String>>,
     settled: HashSet<String>,
+    patches: HashMap<String, Value>,
 }
 
 impl SubagentMapper {
@@ -144,6 +145,10 @@ impl SubagentMapper {
     }
 
     fn map(&mut self, event: &str, payload: &Value) -> Vec<AgentEvent> {
+        let tool_id = field(payload, "tool_call_id");
+        if event == "tool_execution_started" && field(payload, "tool_name") == "patch" {
+            self.patches.insert(tool_id.into(), payload["arguments"].clone());
+        }
         if event == "agent_spawned" {
             let child_id = field(payload, "child_id");
             let spawn_id = field(payload, "tool_call_id");
@@ -198,9 +203,16 @@ impl SubagentMapper {
                 },
             )];
         }
-        let Some(mapped) = map_event(event, payload) else {
-            return Vec::new();
+        let mut mapped = match map_event(event, payload) {
+            Some(mapped) => mapped,
+            None => return Vec::new(),
         };
+        if event == "tool_execution_completed" {
+            let args = self.patches.remove(tool_id);
+            if let (Some(args), AgentEvent::ToolResult { diff, .. }) = (args, &mut mapped) {
+                *diff = patch_diff(&args, payload);
+            }
+        }
         let agent_id = field(payload, "agent_id");
         if self.settled.contains(agent_id) {
             return Vec::new();
@@ -211,6 +223,29 @@ impl SubagentMapper {
             None => Vec::new(),
         }
     }
+}
+
+fn patch_diff(args: &Value, result: &Value) -> Option<ToolDiff> {
+    if field(result, "status") != "success" || !field(result, "result").starts_with("patched ") {
+        return None;
+    }
+    let path = field(args, "path");
+    let old = args.get("old_str")?.as_str()?;
+    let new = args.get("new_str")?.as_str()?;
+    if path.is_empty() || old == new || args["replace_all"].as_bool() == Some(true) {
+        return None;
+    }
+    // The TUI shows the exact replacement hunk, not a whole-file diff.
+    // Keep both sides bounded before sending them through the transcript.
+    const CAP: usize = 4_096;
+    if old.len() > CAP || new.len() > CAP {
+        return None;
+    }
+    Some(ToolDiff {
+        path: path.into(),
+        old_text: Some(old.into()),
+        new_text: new.into(),
+    })
 }
 
 fn map_event(event: &str, payload: &Value) -> Option<AgentEvent> {
@@ -661,6 +696,35 @@ mod tests {
                 },
             }),
         );
+    }
+
+    #[test]
+    fn completed_patch_exposes_the_tui_replacement_hunk() {
+        let mut mapper = SubagentMapper::default();
+        mapper.map("tool_execution_started", &json!({
+            "tool_call_id":"edit-1", "tool_name":"patch",
+            "arguments":{"path":"src/main.py", "old_str":"print('old')\n", "new_str":"print('new')\n"}
+        }));
+        let result = mapper.map("tool_execution_completed", &json!({
+            "tool_call_id":"edit-1", "tool_name":"patch", "status":"success",
+            "result":"patched src/main.py (1 replacement(s), +0 bytes)"
+        }));
+        assert!(matches!(&result[..], [AgentEvent::ToolResult { output: Some(output), diff: Some(diff), .. }]
+            if output.starts_with("patched src/main.py")
+                && diff.path == "src/main.py"
+                && diff.old_text.as_deref() == Some("print('old')\n")
+                && diff.new_text == "print('new')\n"));
+        assert!(mapper.patches.is_empty());
+
+        mapper.map("tool_execution_started", &json!({
+            "tool_call_id":"edit-2", "tool_name":"patch",
+            "arguments":{"path":"src/main.py", "old_str":"missing", "new_str":"new"}
+        }));
+        let failed = mapper.map("tool_execution_completed", &json!({
+            "tool_call_id":"edit-2", "tool_name":"patch", "status":"success",
+            "result":"old_str not found in src/main.py"
+        }));
+        assert!(matches!(&failed[..], [AgentEvent::ToolResult { diff: None, .. }]));
     }
 
     #[test]
