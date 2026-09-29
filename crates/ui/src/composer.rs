@@ -7502,6 +7502,28 @@ impl Composer {
         // Leading indentation distinguishes literal Markdown from native commands
         // and skill invocations. Only the empty-content check may trim the draft.
         let text = self.input.read(cx).text().to_string();
+        if self.pickers.read(cx).resolved(cx).harness == Some(HarnessId::Symphony)
+            && self.staged().is_empty()
+            && self.staged_appshots().is_empty()
+            && !text.contains('\n')
+            && let Some(model_id) = text.strip_prefix("/model ").map(str::trim)
+            && !model_id.is_empty()
+        {
+            if self
+                .pickers
+                .update(cx, |pickers, cx| pickers.select_model_command(model_id, cx))
+            {
+                self.input.update(cx, |input, cx| input.set_text("", cx));
+                self.reset_slash(None, cx);
+                self.failure = None;
+            } else {
+                self.failure = Some(format!(
+                    "Unknown Symphony model: {model_id}. Open /model to choose one."
+                ));
+            }
+            cx.notify();
+            return;
+        }
         if let Some(action) = self
             .slash_cache
             .get(&self.slash.context)

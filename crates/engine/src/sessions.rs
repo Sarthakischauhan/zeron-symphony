@@ -947,13 +947,33 @@ impl SessionsEngine {
         Ok(recovered)
     }
 
-    /// Graceful shutdown: interrupt every live run so streaming entries settle.
+    /// Graceful shutdown: interrupt every live run so streaming entries settle,
+    /// then drop session-owned agent processes (Symphony's stdio child).
     pub async fn shutdown(&self) {
         let chats: Vec<String> = lock(&self.inner.runs).keys().cloned().collect();
-        for chat_id in chats {
-            if let Err(err) = self.interrupt(&chat_id).await {
+        for chat_id in &chats {
+            if let Err(err) = self.interrupt(chat_id).await {
                 tracing::warn!(chat = %chat_id, error = %err, "shutdown interrupt failed");
             }
+        }
+        let parked: Vec<String> = lock(&self.inner.harness_sessions).keys().cloned().collect();
+        for chat_id in parked {
+            self.release_hosted_process(&chat_id);
+        }
+    }
+
+    /// Kill the process kept for this chat's harness session, if the driver
+    /// is already live. A missing or non-Symphony id is a no-op.
+    pub(crate) fn release_hosted_process(&self, chat_id: &str) {
+        let session_id = lock(&self.inner.harness_sessions)
+            .get(chat_id)
+            .map(|known| known.session_id.clone())
+            .filter(|id| !id.is_empty());
+        let Some(session_id) = session_id else {
+            return;
+        };
+        if let Some(harness) = self.inner.registry.if_ready(HarnessId::Symphony) {
+            harness.release_session(&session_id);
         }
     }
 
