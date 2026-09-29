@@ -21,7 +21,7 @@ use crate::{
 
 pub struct SymphonyHarness;
 
-const PROTOCOL_VERSION: u64 = 1;
+const PROTOCOL_VERSION: u64 = 2;
 
 impl SymphonyHarness {
     pub fn new() -> Self {
@@ -214,6 +214,37 @@ fn map_event(event: &str, payload: &Value) -> Option<AgentEvent> {
     }
 }
 
+fn catalog_models(frame: &Value, request_id: &str) -> Result<Vec<Model>, HarnessError> {
+    check_version(frame)?;
+    if field(frame, "type") != "models" || field(frame, "request_id") != request_id {
+        return Err(HarnessError::Protocol(
+            "Unexpected Symphony model response".into(),
+        ));
+    }
+    let models = frame["models"]
+        .as_array()
+        .ok_or_else(|| HarnessError::Protocol("Symphony did not return a model list".into()))?;
+    Ok(models
+        .iter()
+        .filter_map(|item| {
+            let id = item["id"].as_str()?;
+            let reasoning_levels = item["reasoning_levels"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|level| serde_json::from_value::<ReasoningLevel>(level.clone()).ok())
+                .collect();
+            Some(Model {
+                id: id.into(),
+                label: field(item, "label").into(),
+                description: Some(field(item, "description").into()),
+                reasoning_levels,
+                options: vec![],
+            })
+        })
+        .collect())
+}
+
 #[async_trait]
 impl Harness for SymphonyHarness {
     fn id(&self) -> HarnessId {
@@ -250,39 +281,55 @@ impl Harness for SymphonyHarness {
         let exe =
             Self::executable().ok_or_else(|| HarnessError::NotInstalled("symphony".into()))?;
         let mut command = Command::new(&exe);
-        command.args(["stdio", "--models"]);
+        command.arg("stdio");
         crate::compose_child_path(&mut command, &exe);
-        let output = command.output().await?;
-        let frame: Value = serde_json::from_slice(&output.stdout)
-            .map_err(|err| HarnessError::Protocol(format!("Symphony model catalog: {err}")))?;
-        if !output.status.success() {
-            return Err(HarnessError::Protocol(field(&frame, "message").into()));
-        }
-        check_version(&frame)?;
-        let models = frame["models"]
-            .as_array()
-            .ok_or_else(|| HarnessError::Protocol("Symphony did not return a model list".into()))?;
-        Ok(models
-            .iter()
-            .filter_map(|item| {
-                let id = item["id"].as_str()?;
-                let reasoning_levels = item["reasoning_levels"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|level| {
-                        serde_json::from_value::<ReasoningLevel>(level.clone()).ok()
-                    })
-                    .collect();
-                Some(Model {
-                    id: id.into(),
-                    label: field(item, "label").into(),
-                    description: Some(field(item, "description").into()),
-                    reasoning_levels,
-                    options: vec![],
-                })
-            })
-            .collect())
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut child = command.spawn()?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| HarnessError::Protocol("Symphony model probe has no stdin".into()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| HarnessError::Protocol("Symphony model probe has no stdout".into()))?;
+        let probe = async {
+            let mut lines = BufReader::new(stdout).lines();
+            let ready = lines.next_line().await?.ok_or_else(|| {
+                HarnessError::Protocol("Symphony exited before the model handshake".into())
+            })?;
+            let ready: Value = serde_json::from_str(&ready)
+                .map_err(|err| HarnessError::Protocol(format!("Symphony ready frame: {err}")))?;
+            if field(&ready, "type") == "error" {
+                return Err(HarnessError::Protocol(field(&ready, "message").into()));
+            }
+            check_version(&ready)?;
+            if field(&ready, "type") != "ready" {
+                return Err(HarnessError::Protocol("Symphony did not send ready".into()));
+            }
+            let request_id = uuid::Uuid::new_v4().to_string();
+            let request = json!({"type":"model/list", "request_id":request_id}).to_string() + "\n";
+            stdin.write_all(request.as_bytes()).await?;
+            let response = lines.next_line().await?.ok_or_else(|| {
+                HarnessError::Protocol("Symphony exited before listing models".into())
+            })?;
+            let response: Value = serde_json::from_str(&response)
+                .map_err(|err| HarnessError::Protocol(format!("Symphony model frame: {err}")))?;
+            if field(&response, "type") == "error" {
+                return Err(HarnessError::Protocol(field(&response, "message").into()));
+            }
+            catalog_models(&response, &request_id)
+        };
+        let result = tokio::time::timeout(std::time::Duration::from_secs(15), probe)
+            .await
+            .map_err(|_| HarnessError::Protocol("Symphony model discovery timed out".into()))?;
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        result
     }
 
     async fn run(
@@ -509,9 +556,23 @@ mod tests {
 
     #[test]
     fn requires_matching_protocol_version() {
-        assert!(check_version(&json!({"protocol_version": 1})).is_ok());
-        assert!(check_version(&json!({"protocol_version": 2})).is_err());
+        assert!(check_version(&json!({"protocol_version": 2})).is_ok());
+        assert!(check_version(&json!({"protocol_version": 1})).is_err());
         assert!(check_version(&json!({})).is_err());
+    }
+
+    #[test]
+    fn model_response_must_match_the_request() {
+        let frame = json!({
+            "type":"models", "protocol_version":2, "request_id":"probe-1",
+            "models":[{"id":"openai:gpt-test", "label":"gpt-test",
+                       "description":"openai", "reasoning_levels":[]}]
+        });
+        assert_eq!(
+            catalog_models(&frame, "probe-1").unwrap()[0].id,
+            "openai:gpt-test"
+        );
+        assert!(catalog_models(&frame, "probe-2").is_err());
     }
 
     #[test]

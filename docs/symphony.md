@@ -18,7 +18,7 @@ that label does not provide filesystem isolation for Symphony sessions.
    machine running the Zeron engine. Run `uv sync --all-packages` there and
    set `SYMPHONY_EXECUTABLE` to the absolute path of `.venv/bin/symphony`.
    Configure a model provider in Symphony and check it with
-   `"$SYMPHONY_EXECUTABLE" stdio --models`.
+   `printf '{"type":"model/list","request_id":"probe"}\n' | "$SYMPHONY_EXECUTABLE" stdio`.
 2. Build this fork with `cargo build --release --locked -p zeron`.
 3. Run the built `target/release/zeron` from this branch. New sessions use
    Symphony; it is the only advertised runtime. For a remote engine, install
@@ -26,8 +26,9 @@ that label does not provide filesystem isolation for Symphony sessions.
 
 Each Zeron prompt starts a Symphony subprocess. Symphony's session ID is
 stored with the Zeron chat so later prompts resume its JSONL checkpoint.
-The model picker lists models from Symphony's configured providers. Symphony's
-`--models` response includes a qualified ID, display label, provider,
+The model picker lists models from Symphony's configured providers. After the
+version 2 `ready` frame, Zeron sends a correlated `model/list` request on
+stdio. The `models` response includes a qualified ID, display label, provider,
 context limit, and reasoning levels. The model rows and selected model chip
 show provider marks for OpenAI, Anthropic, Gemini, and Grok; other namespaces
 use the Symphony mark. The harness rail always uses the Symphony mark. Zeron
@@ -38,5 +39,5 @@ is routed to Zeron's existing spawn cards and subagent transcript tabs using
 the spawning tool call ID. Plan widgets and live steering are not yet mapped
 into Zeron's specialized views.
 Zeron owns the durable prompt queue and dispatches follow-ups at turn
-boundaries. The host protocol announces version 1; a mismatched Symphony
+boundaries. The host protocol announces version 2; a mismatched Symphony
 installation fails with an update message before starting a prompt.
