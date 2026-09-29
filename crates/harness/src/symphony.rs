@@ -1,5 +1,7 @@
 //! Native Symphony driver. One stdio process handles one persisted turn.
 
+use std::collections::{HashMap, HashSet};
+
 use async_trait::async_trait;
 use futures::{StreamExt, stream::BoxStream};
 use serde_json::{Value, json};
@@ -79,10 +81,111 @@ fn tool_call(name: &str, args: &Value) -> ToolCall {
         "web_search" => ToolCall::WebSearch {
             query: field(args, "query").into(),
         },
+        "spawn_agent" => {
+            let label = field(args, "label").trim();
+            ToolCall::Unknown {
+                name: if label.is_empty() {
+                    "Agent".into()
+                } else {
+                    format!("Agent: {label}")
+                },
+                input: Some(args.clone()),
+            }
+        }
         _ => ToolCall::Unknown {
             name: name.into(),
             input: Some(args.clone()),
         },
+    }
+}
+
+/// Relate Symphony's child IDs to the parent spawn call Zeron uses for its
+/// clickable subagent chip and nested transcript. Events without a known
+/// child are kept on the parent feed.
+#[derive(Default)]
+struct SubagentMapper {
+    paths: HashMap<String, Vec<String>>,
+    settled: HashSet<String>,
+}
+
+impl SubagentMapper {
+    fn tag(path: &[String], mut event: AgentEvent) -> AgentEvent {
+        for parent in path.iter().rev() {
+            event = AgentEvent::Subagent {
+                parent_tool_use_id: parent.clone(),
+                event: Box::new(event),
+            };
+        }
+        event
+    }
+
+    fn map(&mut self, event: &str, payload: &Value) -> Vec<AgentEvent> {
+        if event == "agent_spawned" {
+            let child_id = field(payload, "child_id");
+            let spawn_id = field(payload, "tool_call_id");
+            if child_id.is_empty() || spawn_id.is_empty() {
+                return Vec::new();
+            }
+            if !field(payload, "parent_id").is_empty()
+                && !self.paths.contains_key(field(payload, "agent_id"))
+            {
+                return Vec::new();
+            }
+            let mut path = self
+                .paths
+                .get(field(payload, "agent_id"))
+                .cloned()
+                .unwrap_or_default();
+            path.push(spawn_id.into());
+            self.paths.insert(child_id.into(), path.clone());
+            let prompt = field(payload, "prompt");
+            return if prompt.is_empty() {
+                Vec::new()
+            } else {
+                vec![Self::tag(
+                    &path,
+                    AgentEvent::UserMessage {
+                        text: prompt.into(),
+                    },
+                )]
+            };
+        }
+        if matches!(event, "agent_completed" | "agent_failed") {
+            let child_id = field(payload, "child_id");
+            let Some(path) = self.paths.remove(child_id) else {
+                return Vec::new();
+            };
+            self.settled.insert(child_id.into());
+            let failed = event == "agent_failed";
+            let cancelled = failed && field(payload, "error_type") == "HarnessCancelled";
+            return vec![Self::tag(
+                &path,
+                AgentEvent::Done {
+                    status: if cancelled {
+                        DoneStatus::Interrupted
+                    } else if failed {
+                        DoneStatus::Errored
+                    } else {
+                        DoneStatus::Completed
+                    },
+                    result: None,
+                    error: failed.then(|| field(payload, "message").to_owned()),
+                    session_id: None,
+                },
+            )];
+        }
+        let Some(mapped) = map_event(event, payload) else {
+            return Vec::new();
+        };
+        let agent_id = field(payload, "agent_id");
+        if self.settled.contains(agent_id) {
+            return Vec::new();
+        }
+        match self.paths.get(agent_id) {
+            Some(path) => vec![Self::tag(path, mapped)],
+            None if field(payload, "parent_id").is_empty() => vec![mapped],
+            None => Vec::new(),
+        }
     }
 }
 
@@ -235,6 +338,7 @@ impl Harness for SymphonyHarness {
             let mut interrupted = false;
             let mut started = false;
             let mut error = None;
+            let mut subagents = SubagentMapper::default();
             // Symphony emits ready before accepting a prompt.
             loop {
                 let next = tokio::select! {
@@ -272,7 +376,7 @@ impl Harness for SymphonyHarness {
                         started = true;
                     }
                     "event" => {
-                        if let Some(mapped) = map_event(field(&frame, "event"), &frame["payload"]) {
+                        for mapped in subagents.map(field(&frame, "event"), &frame["payload"]) {
                             let _ = tx.send(Ok(mapped));
                         }
                     }
@@ -408,5 +512,128 @@ mod tests {
         assert!(check_version(&json!({"protocol_version": 1})).is_ok());
         assert!(check_version(&json!({"protocol_version": 2})).is_err());
         assert!(check_version(&json!({})).is_err());
+    }
+
+    #[test]
+    fn routes_child_activity_to_the_spawn_chip() {
+        let mut mapper = SubagentMapper::default();
+        let call = mapper.map(
+            "tool_execution_started",
+            &json!({
+                "agent_id":"parent", "tool_call_id":"spawn-1", "tool_name":"spawn_agent",
+                "arguments":{"prompt":"Inspect tests", "label":"Tests", "model_id":"provider:small"}
+            }),
+        );
+        assert!(matches!(&call[..], [AgentEvent::ToolCall { id, call }]
+            if id == "spawn-1" && call.is_subagent_spawn()
+                && call.subagent_model() == Some("provider:small")));
+
+        let opening = mapper.map(
+            "agent_spawned",
+            &json!({
+                "agent_id":"parent", "child_id":"child-1", "tool_call_id":"spawn-1",
+                "prompt":"Inspect tests"
+            }),
+        );
+        assert!(
+            matches!(&opening[..], [AgentEvent::Subagent { parent_tool_use_id, event }]
+            if parent_tool_use_id == "spawn-1"
+                && matches!(event.as_ref(), AgentEvent::UserMessage { text } if text == "Inspect tests"))
+        );
+
+        let child = mapper.map(
+            "text_delta",
+            &json!({"agent_id":"child-1", "delta":"Found tests"}),
+        );
+        assert!(
+            matches!(&child[..], [AgentEvent::Subagent { parent_tool_use_id, event }]
+            if parent_tool_use_id == "spawn-1"
+                && matches!(event.as_ref(), AgentEvent::TextDelta { text } if text == "Found tests"))
+        );
+        let child_tool = mapper.map(
+            "tool_execution_started",
+            &json!({
+                "agent_id":"child-1", "parent_id":"parent", "tool_call_id":"read-1",
+                "tool_name":"read_file", "arguments":{"path":"tests/test_agent.py"}
+            }),
+        );
+        assert!(
+            matches!(&child_tool[..], [AgentEvent::Subagent { parent_tool_use_id, event }]
+            if parent_tool_use_id == "spawn-1"
+                && matches!(event.as_ref(), AgentEvent::ToolCall { id, .. } if id == "read-1"))
+        );
+        assert_eq!(
+            mapper.map(
+                "text_delta",
+                &json!({"agent_id":"parent", "delta":"Parent"})
+            ),
+            vec![AgentEvent::TextDelta {
+                text: "Parent".into()
+            }]
+        );
+
+        let done = mapper.map("agent_completed", &json!({"child_id":"child-1"}));
+        assert!(
+            matches!(&done[..], [AgentEvent::Subagent { parent_tool_use_id, event }]
+            if parent_tool_use_id == "spawn-1"
+                && matches!(event.as_ref(), AgentEvent::Done { status: DoneStatus::Completed, .. }))
+        );
+        assert!(mapper.paths.is_empty());
+        assert!(
+            mapper
+                .map(
+                    "text_delta",
+                    &json!({
+                        "agent_id":"child-1", "parent_id":"parent", "delta":"late"
+                    })
+                )
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn child_failure_and_unmatched_spawn_do_not_leak_to_parent() {
+        let mut mapper = SubagentMapper::default();
+        assert!(
+            mapper
+                .map(
+                    "agent_spawned",
+                    &json!({
+                        "child_id":"orphan", "tool_call_id":"", "prompt":"task"
+                    })
+                )
+                .is_empty()
+        );
+        assert!(
+            mapper
+                .map("agent_failed", &json!({"child_id":"orphan"}))
+                .is_empty()
+        );
+        assert!(
+            mapper
+                .map(
+                    "text_delta",
+                    &json!({
+                        "agent_id":"orphan", "parent_id":"parent", "delta":"unknown child"
+                    })
+                )
+                .is_empty()
+        );
+        mapper.map(
+            "agent_spawned",
+            &json!({
+                "child_id":"child", "tool_call_id":"spawn", "prompt":"task"
+            }),
+        );
+        let failed = mapper.map(
+            "agent_failed",
+            &json!({
+                "child_id":"child", "error_type":"HarnessCancelled", "message":"Child cancelled"
+            }),
+        );
+        assert!(matches!(&failed[..], [AgentEvent::Subagent { event, .. }]
+            if matches!(event.as_ref(), AgentEvent::Done {
+                status: DoneStatus::Interrupted, error: Some(message), ..
+            } if message == "Child cancelled")));
     }
 }
