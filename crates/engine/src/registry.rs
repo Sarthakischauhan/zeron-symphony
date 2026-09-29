@@ -481,6 +481,14 @@ impl HarnessRegistry {
         }
     }
 
+    /// Already-built driver, if a run has resolved it. Does not force a lazy factory.
+    pub fn if_ready(&self, id: HarnessId) -> Option<Arc<dyn Harness>> {
+        match self.slots().get(&id) {
+            Some(Slot::Ready(harness)) => Some(harness.clone()),
+            _ => None,
+        }
+    }
+
     pub fn resolve(&self, id: HarnessId) -> Result<Arc<dyn Harness>, HarnessError> {
         let mut slots = self.slots();
         match slots.get(&id) {
