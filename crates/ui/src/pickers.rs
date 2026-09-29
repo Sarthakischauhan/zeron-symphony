@@ -1671,6 +1671,33 @@ impl Pickers {
         cx.notify();
     }
 
+    pub(crate) fn select_model_command(&mut self, model_id: &str, cx: &mut Context<Self>) -> bool {
+        let Some(harness) = self.effective_harness(cx) else {
+            return false;
+        };
+        let matches: Vec<String> = self
+            .models
+            .get(&harness)
+            .and_then(|catalog| catalog.ready())
+            .into_iter()
+            .flatten()
+            .filter(|model| {
+                model.id.eq_ignore_ascii_case(model_id)
+                    || model.label.eq_ignore_ascii_case(model_id)
+                    || model
+                        .id
+                        .split_once(':')
+                        .is_some_and(|(_, name)| name.eq_ignore_ascii_case(model_id))
+            })
+            .map(|model| model.id.clone())
+            .collect();
+        if matches.len() != 1 {
+            return false;
+        }
+        self.pick_model(matches[0].clone(), cx);
+        true
+    }
+
     fn pick_model(&mut self, model_id: String, cx: &mut Context<Self>) {
         self.setting_menu = None;
         if self.title.is_some() {

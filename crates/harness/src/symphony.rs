@@ -12,11 +12,14 @@ use tokio::{
     sync::{Mutex, mpsc},
 };
 use zeron_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode, ToolCall,
-    UserInputQuestion,
+    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SlashCommand,
+    SteeringMode, ToolCall, UserInputQuestion,
 };
 
-use crate::{Harness, HarnessError, RunControls, process::Command};
+use crate::{
+    Harness, HarnessError, RunControls,
+    process::{Command, Stdio},
+};
 
 pub struct SymphonyHarness {
     sessions: Arc<SessionTable>,
@@ -554,6 +557,72 @@ impl Harness for SymphonyHarness {
     }
     fn release_session(&self, session_id: &str) {
         self.sessions.release(session_id);
+    }
+
+    async fn commands_for(&self, cwd: &std::path::Path) -> Result<Vec<SlashCommand>, HarnessError> {
+        let exe =
+            Self::executable().ok_or_else(|| HarnessError::NotInstalled("symphony".into()))?;
+        let mut command = Command::new(&exe);
+        command.arg("stdio").arg("--workspace").arg(cwd);
+        Self::configure(&mut command, &exe);
+        crate::compose_child_path(&mut command, &exe);
+        command
+            .current_dir(cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut child = command.spawn()?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| HarnessError::Protocol("Symphony command probe has no stdin".into()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| HarnessError::Protocol("Symphony command probe has no stdout".into()))?;
+        let probe = async {
+            let mut lines = BufReader::new(stdout).lines();
+            let ready = lines.next_line().await?.ok_or_else(|| {
+                HarnessError::Protocol("Symphony exited before the command handshake".into())
+            })?;
+            let ready: Value = serde_json::from_str(&ready)
+                .map_err(|err| HarnessError::Protocol(format!("Symphony ready frame: {err}")))?;
+            if field(&ready, "type") == "error" {
+                return Err(HarnessError::Protocol(field(&ready, "message").into()));
+            }
+            check_version(&ready)?;
+            if field(&ready, "type") != "ready" {
+                return Err(HarnessError::Protocol("Symphony did not send ready".into()));
+            }
+            let request_id = uuid::Uuid::new_v4().to_string();
+            let request =
+                json!({"type":"command/list", "request_id":request_id}).to_string() + "\n";
+            stdin.write_all(request.as_bytes()).await?;
+            let frame = lines.next_line().await?.ok_or_else(|| {
+                HarnessError::Protocol("Symphony exited before listing commands".into())
+            })?;
+            let frame: Value = serde_json::from_str(&frame)
+                .map_err(|err| HarnessError::Protocol(format!("Symphony command frame: {err}")))?;
+            if field(&frame, "type") != "commands" || field(&frame, "request_id") != request_id {
+                return Err(HarnessError::Protocol(
+                    "Symphony command response did not match".into(),
+                ));
+            }
+            check_version(&frame)?;
+            let mut commands: Vec<SlashCommand> = serde_json::from_value(frame["commands"].clone())
+                .map_err(|err| HarnessError::Protocol(format!("Symphony commands: {err}")))?;
+            // These actions already belong to Zeron's shell. Keep their
+            // unqualified names for the native picker, new-chat and diff UI.
+            commands.retain(|item| !matches!(item.name.as_str(), "model" | "new" | "diff"));
+            Ok(commands)
+        };
+        let result = tokio::time::timeout(std::time::Duration::from_secs(15), probe)
+            .await
+            .map_err(|_| HarnessError::Protocol("Symphony command discovery timed out".into()))?;
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        result
     }
 
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
