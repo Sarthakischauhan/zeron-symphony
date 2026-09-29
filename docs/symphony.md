@@ -1,26 +1,28 @@
 # Symphony in Zeron
 
-This fork runs the Symphony coding agent through its `symphony stdio` JSONL
+This fork runs the Symphony coding agent through its versioned `symphony stdio` JSONL
 transport. Zeron hosts the session UI, transcript, approval questions, and
 optional device sync; Symphony owns its model loop, tools, skills, plugins,
 and checkpoint files. The GPUI implementation remains in `crates/ui/` for
 further customization.
 
-Zeron's `sandbox` setting is not applied by this driver. Symphony's own
+New Symphony chats record full filesystem access because Zeron's sandbox
+setting is not applied by this driver. Symphony's own
 approval and deny rules govern tools; its workspace tools can address paths
-outside the selected repository. Do not treat Zeron's `WorkspaceWrite` label
-as filesystem isolation for Symphony sessions.
+outside the selected repository. Older chats may still show `WorkspaceWrite`;
+that label does not provide filesystem isolation for Symphony sessions.
 
 ## Local setup
 
-1. Install the Symphony branch containing `symphony stdio` on the machine
-   running the Zeron engine. From the Symphony source checkout, run
-   `uv sync --all-packages` and set `SYMPHONY_EXECUTABLE` to the absolute path
-   of its `.venv/bin/symphony`. Configure a model provider in Symphony.
+1. Check out `feat/zeron-stdio-agent` from `Sarthakischauhan/symphony` on the
+   machine running the Zeron engine. Run `uv sync --all-packages` there and
+   set `SYMPHONY_EXECUTABLE` to the absolute path of `.venv/bin/symphony`.
+   Configure a model provider in Symphony and check it with
+   `"$SYMPHONY_EXECUTABLE" stdio --models`.
 2. Build this fork with `cargo build --release --locked -p zeron`.
-3. Run the built `target/release/zeron`, enable Symphony under Settings →
-   Providers if needed, and select Symphony for a new session. For a remote
-   engine, install Symphony and set `SYMPHONY_EXECUTABLE` there instead.
+3. Run the built `target/release/zeron` from this branch. New sessions use
+   Symphony; it is the only advertised runtime. For a remote engine, install
+   Symphony and set `SYMPHONY_EXECUTABLE` on that device instead.
 
 Each Zeron prompt starts a Symphony subprocess. Symphony's session ID is
 stored with the Zeron chat so later prompts resume its JSONL checkpoint.
@@ -29,3 +31,6 @@ through Zeron's input panel. Zeron's auto-approve option selects Symphony's
 unattended policy, including its deny rules. This driver does not yet map Symphony's child
 agent tree, plan widgets, or live steering into
 specialized Zeron views. Those events remain in Symphony's own persistence.
+Zeron owns the durable prompt queue and dispatches follow-ups at turn
+boundaries. The host protocol announces version 1; a mismatched Symphony
+installation fails with an update message before starting a prompt.

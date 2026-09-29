@@ -1,4 +1,17 @@
-# Zeron
+# Zeron Symphony (first draft)
+
+This fork runs Symphony as its coding agent. The desktop app and local engine
+use Symphony by default, and the engine advertises only Symphony to the new
+session composer. Zeron supplies workspaces, chat history, message queue, and
+optional device sync; Symphony executes turns and stores its own checkpoints.
+
+For a working build from the two feature branches, follow
+[the Symphony setup guide](docs/symphony.md). The rest of this README describes
+the upstream Zeron product and some commands and release links still refer to
+upstream builds. This draft does not yet bundle the Python runtime or redesign
+the app shell.
+
+## Upstream Zeron reference
 
 Control your coding agents (Claude Code, Codex, Cursor, Devin, Grok, Hermes, Pi, Antigravity) locally by default, with optional multi-device sync.
 
