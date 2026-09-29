@@ -19,6 +19,8 @@ use crate::{
 
 pub struct SymphonyHarness;
 
+const PROTOCOL_VERSION: u64 = 1;
+
 impl SymphonyHarness {
     pub fn new() -> Self {
         Self
@@ -153,6 +155,7 @@ impl Harness for SymphonyHarness {
         if !output.status.success() {
             return Err(HarnessError::Protocol(field(&frame, "message").into()));
         }
+        check_version(&frame)?;
         let models = frame["models"]
             .as_array()
             .ok_or_else(|| HarnessError::Protocol("Symphony did not return a model list".into()))?;
@@ -248,6 +251,10 @@ impl Harness for SymphonyHarness {
                 };
                 match field(&frame, "type") {
                     "ready" => {
+                        if let Err(err) = check_version(&frame) {
+                            error = Some(err.to_string());
+                            break;
+                        }
                         session_id = Some(field(&frame, "session_id").into());
                         let _ = tx.send(Ok(AgentEvent::SessionStarted {
                             harness: HarnessId::Symphony,
@@ -314,7 +321,7 @@ impl Harness for SymphonyHarness {
                         let _ = tx.send(Ok(AgentEvent::Done {
                             status,
                             result: None,
-                            error,
+                            error: error.clone(),
                             session_id: session_id.clone(),
                         }));
                         break;
@@ -333,14 +340,16 @@ impl Harness for SymphonyHarness {
                     error: if interrupted {
                         None
                     } else {
-                        Some(
-                            if started {
-                                "Symphony exited before completing the turn"
-                            } else {
-                                "Symphony failed to start"
-                            }
-                            .into(),
-                        )
+                        error.or_else(|| {
+                            Some(
+                                if started {
+                                    "Symphony exited before completing the turn"
+                                } else {
+                                    "Symphony failed to start"
+                                }
+                                .into(),
+                            )
+                        })
                     },
                     session_id,
                 }));
@@ -352,6 +361,17 @@ impl Harness for SymphonyHarness {
             rx.recv().await.map(|event| (event, rx))
         })
         .boxed())
+    }
+}
+
+fn check_version(frame: &Value) -> Result<(), HarnessError> {
+    let version = frame["protocol_version"].as_u64();
+    if version == Some(PROTOCOL_VERSION) {
+        Ok(())
+    } else {
+        Err(HarnessError::Protocol(format!(
+            "Symphony protocol version {version:?}; expected {PROTOCOL_VERSION}. Update the Symphony installation"
+        )))
     }
 }
 
@@ -381,5 +401,12 @@ mod tests {
                 },
             }),
         );
+    }
+
+    #[test]
+    fn requires_matching_protocol_version() {
+        assert!(check_version(&json!({"protocol_version": 1})).is_ok());
+        assert!(check_version(&json!({"protocol_version": 2})).is_err());
+        assert!(check_version(&json!({})).is_err());
     }
 }
