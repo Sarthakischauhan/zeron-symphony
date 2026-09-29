@@ -1140,6 +1140,9 @@ impl EngineRpc {
                 let sessions = self.sessions.clone();
                 let doc_host = self.doc_host.clone();
                 let chat_ids = deleted.chat_ids;
+                for chat_id in &chat_ids {
+                    sessions.release_hosted_process(chat_id);
+                }
                 tokio::spawn(async move {
                     for chat_id in chat_ids {
                         if let Err(err) = sessions.interrupt(&chat_id).await {
@@ -1193,6 +1196,7 @@ impl EngineRpc {
                 .map_err(failed)
                 .map(drop),
             MutateParams::DeleteChat { chat_id } => {
+                self.sessions.release_hosted_process(&chat_id);
                 self.workspace.delete_chat(&chat_id).map_err(failed)?;
                 self.doc_host.purge_chat(&chat_id);
                 Ok(())
