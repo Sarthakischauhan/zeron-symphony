@@ -406,6 +406,12 @@ impl Harness for SymphonyHarness {
                             error = Some(err.to_string());
                             break;
                         }
+                        if let Err(err) =
+                            check_ready_model(request.model.as_deref(), field(&frame, "model"))
+                        {
+                            error = Some(err.to_string());
+                            break;
+                        }
                         session_id = Some(field(&frame, "session_id").into());
                         let _ = tx.send(Ok(AgentEvent::SessionStarted {
                             harness: HarnessId::Symphony,
@@ -526,6 +532,22 @@ fn check_version(frame: &Value) -> Result<(), HarnessError> {
     }
 }
 
+fn check_ready_model(requested: Option<&str>, actual: &str) -> Result<(), HarnessError> {
+    if actual.is_empty() {
+        return Err(HarnessError::Protocol(
+            "Symphony did not report its model".into(),
+        ));
+    }
+    if let Some(requested) = requested.filter(|model| *model != "default")
+        && requested != actual
+    {
+        return Err(HarnessError::Protocol(format!(
+            "Symphony selected {actual} instead of requested model {requested}"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -559,6 +581,14 @@ mod tests {
         assert!(check_version(&json!({"protocol_version": 2})).is_ok());
         assert!(check_version(&json!({"protocol_version": 1})).is_err());
         assert!(check_version(&json!({})).is_err());
+    }
+
+    #[test]
+    fn requested_model_must_match_the_agent_ready_frame() {
+        assert!(check_ready_model(Some("grok:grok-4.7"), "grok:grok-4.7").is_ok());
+        assert!(check_ready_model(Some("default"), "openai:gpt-5.6-luna").is_ok());
+        assert!(check_ready_model(Some("grok:grok-4.7"), "openai:gpt-5.6-luna").is_err());
+        assert!(check_ready_model(None, "").is_err());
     }
 
     #[test]
