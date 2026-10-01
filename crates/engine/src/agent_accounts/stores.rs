@@ -837,6 +837,13 @@ impl AgentAccounts {
         harness: HarnessId,
         store_key: &str,
     ) -> Option<serde_json::Value> {
+        if harness == HarnessId::Symphony {
+            return self
+                .symphony_file(store_key)
+                .ok()
+                .and_then(|p| read_json(&p))
+                .filter(|e| str_field(e, "access_token").is_some());
+        }
         read_json(&self.keyed_file(harness))?
             .get(store_key)
             .filter(|entry| oauth_entry(entry))
@@ -854,6 +861,9 @@ impl AgentAccounts {
         store_key: &str,
         entry: Option<&serde_json::Value>,
     ) -> Result<(), EngineError> {
+        if harness == HarnessId::Symphony {
+            return self.write_symphony_entry(store_key, entry);
+        }
         let file = self.keyed_file(harness);
         let lock = match harness {
             HarnessId::Pi => StoreLock::Dir(lock_path(&file)),
@@ -893,6 +903,10 @@ impl AgentAccounts {
         harness: HarnessId,
         store_key: &str,
     ) -> Option<Option<Detected>> {
+        if harness == HarnessId::Symphony {
+            let entry = self.live_keyed_entry(harness, store_key)?;
+            return Some(self.identify_symphony_entry(store_key, &entry).await);
+        }
         let upstream = upstream_of(harness, store_key)?;
         let entry = self.live_keyed_entry(harness, store_key)?;
         Some(
@@ -1514,4 +1528,387 @@ pub(super) fn recorded_devin_url(url_file: &Path, logs: &Path) -> Option<String>
         }
     }
     None
+}
+
+// Symphony keeps each provider's original token document separately. Never
+// normalize it to Pi's schema: extra and future fields must survive a swap.
+const SYMPHONY_PROVIDERS: &[&str] = &["openai", "anthropic", "gemini", "grok", "openrouter", "vercel", "ollama", "local"];
+
+pub(super) fn symphony_detected(provider: &str, entry: &serde_json::Value) -> Option<Detected> {
+    let token = str_field(entry, "access_token")?;
+    let claims = jwt_claims(&token).unwrap_or_default();
+    let id = str_field(entry, "id_token")
+        .and_then(|s| jwt_claims(&s))
+        .unwrap_or_default();
+    let auth = claims
+        .get("https://api.openai.com/auth")
+        .or_else(|| id.get("https://api.openai.com/auth"));
+    let email = str_field(entry, "email")
+        .or_else(|| str_field(&claims, "email"))
+        .or_else(|| str_field(&id, "email"))
+        .or_else(|| {
+            claims
+                .get("https://api.openai.com/profile")
+                .and_then(|p| str_field(p, "email"))
+        });
+    let workspace = str_field(entry, "account_id")
+        .or_else(|| auth.and_then(|a| str_field(a, "chatgpt_account_id")));
+    let seat = auth
+        .and_then(|a| str_field(a, "chatgpt_user_id"))
+        .or_else(|| str_field(&id, "sub"));
+    let identity = workspace
+        .map(|workspace| match seat {
+            Some(seat) => format!("{seat}:{workspace}"),
+            None => workspace,
+        })
+        .or_else(|| email.clone())
+        .or_else(|| str_field(&claims, "sub"))
+        .unwrap_or_else(|| {
+            format!(
+                "local-{}",
+                BASE64_URL.encode(Sha256::digest(token.as_bytes()))
+            )
+        });
+    let (label, auth_kind) = match provider {
+        "openai" => ("ChatGPT", AgentAuthKind::Oauth),
+        "anthropic" => ("Claude", AgentAuthKind::Oauth),
+        "grok" => ("Grok", AgentAuthKind::Oauth),
+        "gemini" => ("Gemini", AgentAuthKind::ApiKey),
+        "openrouter" => ("OpenRouter", AgentAuthKind::ApiKey),
+        "vercel" => ("Vercel", AgentAuthKind::ApiKey),
+        "ollama" => ("Ollama", AgentAuthKind::ApiKey),
+        "local" => ("Local", AgentAuthKind::ApiKey),
+        _ => return None,
+    };
+    Some(
+        Detected::known(
+            format!("{provider}:{identity}"),
+            SlotProfile {
+                email: email.unwrap_or_else(|| format!("{label} account")),
+                display_name: str_field(&claims, "name"),
+                organization: None,
+                plan: Some(label.to_string()),
+                auth_kind,
+            },
+            entry.clone(),
+        )
+        .keyed(provider),
+    )
+}
+
+impl AgentAccounts {
+    fn symphony_env_key(provider: &str) -> Option<&'static str> {
+        match provider {
+            "gemini" => Some("GEMINI_API_KEY"),
+            "openrouter" => Some("OPENROUTER_API_KEY"),
+            "vercel" => Some("AI_GATEWAY_API_KEY"),
+            "ollama" => Some("OLLAMA_BASE_URL"),
+            "local" => Some("LOCAL_BASE_URL"),
+            _ => None,
+        }
+    }
+
+    fn symphony_file(&self, provider: &str) -> Result<PathBuf, EngineError> {
+        if !SYMPHONY_PROVIDERS.contains(&provider) {
+            return Err(EngineError::Other("Unknown Symphony provider.".into()));
+        }
+        Ok(self
+            .inner
+            .config
+            .symphony_home
+            .join("oauth")
+            .join(format!("{provider}.json")))
+    }
+
+    async fn identify_symphony_entry(
+        &self,
+        provider: &str,
+        entry: &serde_json::Value,
+    ) -> Option<Detected> {
+        let detected = symphony_detected(provider, entry)?;
+        if provider != "anthropic" || !detected.account_key.starts_with("anthropic:local-") {
+            return Some(detected);
+        }
+        // Python's refresh may omit account_id. Reuse the known identity when
+        // either credential still matches, otherwise resolve through the same
+        // cached read-only profile lookup used for Pi's opaque Claude tokens.
+        if let Some(slot) = self
+            .read_slots(HarnessId::Symphony)
+            .into_iter()
+            .find(|slot| {
+                slot.store_key.as_deref() == Some(provider)
+                    && ["access_token", "refresh_token"].iter().any(|field| {
+                        str_field(entry, field).is_some_and(|value| {
+                            str_field(&slot.credentials, field).as_deref() == Some(value.as_str())
+                        })
+                    })
+            })
+        {
+            return Some(
+                Detected::known(slot.account_key, slot.profile, entry.clone()).keyed(provider),
+            );
+        }
+        let generic = serde_json::json!({"access": entry.get("access_token"), "refresh": entry.get("refresh_token")});
+        match self
+            .identify_opaque(HarnessId::Symphony, provider, Upstream::Anthropic, &generic)
+            .await
+        {
+            Some(identity) => Some(
+                Detected::known(identity.account_key, identity.profile, entry.clone())
+                    .keyed(provider),
+            ),
+            None => Some(detected),
+        }
+    }
+
+    pub(super) async fn detect_symphony(&self) -> Vec<Detected> {
+        let mut detected = Vec::new();
+        for provider in SYMPHONY_PROVIDERS {
+            if let Some(entry) = self.live_keyed_entry(HarnessId::Symphony, provider) {
+                if let Some(account) = self.identify_symphony_entry(provider, &entry).await {
+                    detected.push(account);
+                }
+            } else if let Some(key) = Self::symphony_env_key(provider)
+                && let Some(value) = self.symphony_env_value(key)
+            {
+                let entry = serde_json::json!({"access_token": value, "auth": "api-key"});
+                if let Some(account) = symphony_detected(provider, &entry) {
+                    detected.push(account);
+                }
+            }
+        }
+        detected
+    }
+
+    fn symphony_env_value(&self, key: &str) -> Option<String> {
+        let text = std::fs::read_to_string(self.inner.config.symphony_home.join(".env")).ok()?;
+        text.lines().rev().find_map(|line| {
+            let bare = line.trim_start().strip_prefix("export ").unwrap_or(line.trim_start());
+            let (name, value) = bare.split_once('=')?;
+            (name.trim() == key && !value.trim().is_empty()).then(|| value.trim().to_string())
+        })
+    }
+
+    fn write_symphony_entry(
+        &self,
+        provider: &str,
+        entry: Option<&serde_json::Value>,
+    ) -> Result<(), EngineError> {
+        let file = self.symphony_file(provider)?;
+        if let Some(env_key) = Self::symphony_env_key(provider) {
+            return match entry {
+                Some(entry) => {
+                    let value = str_field(entry, "access_token").ok_or_else(|| {
+                        EngineError::Other("Symphony API credentials have no value.".into())
+                    })?;
+                    let home = &self.inner.config.symphony_home;
+                    private_dir(home)?;
+                    let env_file = home.join(".env");
+                    let text = match std::fs::read_to_string(&env_file) {
+                        Ok(text) => text,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                        Err(e) => return Err(e.into()),
+                    };
+                    let mut lines: Vec<String> = text
+                        .lines()
+                        .filter(|line| {
+                            let bare = line.trim_start().strip_prefix("export ").unwrap_or(line.trim_start());
+                            bare.split_once('=').is_none_or(|(name, _)| name.trim() != env_key)
+                        })
+                        .map(str::to_string)
+                        .collect();
+                    lines.push(format!("{env_key}={value}"));
+                    write_file_atomic(&env_file, format!("{}\n", lines.join("\n")).as_bytes(), true)
+                }
+                None => self.remove_symphony_env(env_key),
+            };
+        }
+        match entry {
+            Some(entry) => {
+                if str_field(entry, "access_token").is_none() {
+                    return Err(EngineError::Other(
+                        "Symphony OAuth credentials have no access token.".into(),
+                    ));
+                }
+                private_dir(&self.inner.config.symphony_home)?;
+                private_dir(file.parent().unwrap())?;
+                write_file_atomic(
+                    &file,
+                    serde_json::to_vec_pretty(entry)
+                        .map_err(|e| EngineError::Other(e.to_string()))?
+                        .as_slice(),
+                    true,
+                )?;
+                let env_file = self.inner.config.symphony_home.join(".env");
+                let text = match std::fs::read_to_string(&env_file) {
+                    Ok(text) => text,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                    Err(e) => return Err(e.into()),
+                };
+                let key = format!("SYMPHONY_{}_AUTH", provider.to_ascii_uppercase());
+                let mut lines: Vec<String> = text
+                    .lines()
+                    .filter(|line| {
+                        let line = line
+                            .trim_start()
+                            .strip_prefix("export ")
+                            .unwrap_or(line.trim_start());
+                        line.split_once('=')
+                            .is_none_or(|(name, _)| name.trim() != key)
+                    })
+                    .map(str::to_string)
+                    .collect();
+                lines.push(format!("{key}=oauth"));
+                write_file_atomic(
+                    &env_file,
+                    format!("{}\n", lines.join("\n")).as_bytes(),
+                    true,
+                )
+            }
+            None => remove_if_exists(&file),
+        }
+    }
+
+    fn remove_symphony_env(&self, key: &str) -> Result<(), EngineError> {
+        let env_file = self.inner.config.symphony_home.join(".env");
+        let text = match std::fs::read_to_string(&env_file) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        let lines: Vec<_> = text
+            .lines()
+            .filter(|line| {
+                let bare = line.trim_start().strip_prefix("export ").unwrap_or(line.trim_start());
+                bare.split_once('=').is_none_or(|(name, _)| name.trim() != key)
+            })
+            .collect();
+        write_file_atomic(&env_file, format!("{}\n", lines.join("\n")).as_bytes(), true)
+    }
+}
+
+#[cfg(test)]
+mod symphony_storage_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn symphony_snapshots_switches_and_removes_one_provider() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = AgentAccountsConfig::isolated(temp.path());
+        let home = config.symphony_home.clone();
+        let accounts = AgentAccounts::new(config);
+        let first = serde_json::json!({"access_token":"first", "refresh_token":"refresh", "expires_at":123.5, "account_id":"one", "email":"one@example.com", "extra":{"opaque":true}});
+        let second = serde_json::json!({"access_token":"second", "account_id":"two", "email":"two@example.com"});
+        let other = serde_json::json!({"access_token":"claude", "account_id":"claude-id", "email":"claude@example.com"});
+        accounts
+            .write_keyed_entry(HarnessId::Symphony, "openai", Some(&first))
+            .unwrap();
+        accounts
+            .write_keyed_entry(HarnessId::Symphony, "anthropic", Some(&other))
+            .unwrap();
+        std::fs::write(
+            home.join(".env"),
+            "UNRELATED=value\nSYMPHONY_OPENAI_AUTH=key\nSYMPHONY_ANTHROPIC_AUTH=oauth\n",
+        )
+        .unwrap();
+        let snapshot = accounts.list(false).await.unwrap();
+        let id = snapshot
+            .accounts
+            .iter()
+            .find(|a| a.harness == HarnessId::Symphony && a.provider.as_deref() == Some("openai"))
+            .unwrap()
+            .id
+            .clone();
+        accounts
+            .write_keyed_entry(HarnessId::Symphony, "openai", Some(&second))
+            .unwrap();
+        let snapshot = accounts.activate(HarnessId::Symphony, &id).await.unwrap();
+        assert_eq!(
+            snapshot
+                .accounts
+                .iter()
+                .filter(|a| a.harness == HarnessId::Symphony)
+                .count(),
+            3
+        );
+        assert_eq!(
+            accounts.live_keyed_entry(HarnessId::Symphony, "openai"),
+            Some(first)
+        );
+        assert_eq!(
+            accounts.live_keyed_entry(HarnessId::Symphony, "anthropic"),
+            Some(other.clone())
+        );
+        let env = std::fs::read_to_string(home.join(".env")).unwrap();
+        assert!(env.contains("UNRELATED=value\n"));
+        assert!(env.contains("SYMPHONY_OPENAI_AUTH=oauth\n"));
+        assert!(!env.contains("SYMPHONY_OPENAI_AUTH=key"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(home.join("oauth/openai.json"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(home.join("oauth"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+        accounts.forget(HarnessId::Symphony, &id).await.unwrap();
+        assert!(!home.join("oauth/openai.json").exists());
+        assert_eq!(
+            accounts.live_keyed_entry(HarnessId::Symphony, "anthropic"),
+            Some(other)
+        );
+        assert!(
+            accounts
+                .write_keyed_entry(HarnessId::Symphony, "../bad", Some(&second))
+                .is_err()
+        );
+    }
+    #[test]
+    fn symphony_chatgpt_team_seats_have_distinct_keys() {
+        let token = |seat: &str| {
+            let claims = serde_json::json!({"email":format!("{seat}@example.com"),
+                "https://api.openai.com/auth":{"chatgpt_account_id":"shared-team", "chatgpt_user_id":seat}});
+            serde_json::json!({"access_token":format!("e30.{}.sig", BASE64_URL.encode(claims.to_string())), "account_id":"shared-team"})
+        };
+        assert_ne!(
+            symphony_detected("openai", &token("one"))
+                .unwrap()
+                .account_key,
+            symphony_detected("openai", &token("two"))
+                .unwrap()
+                .account_key
+        );
+    }
+
+    #[tokio::test]
+    async fn symphony_claude_refresh_reuses_saved_identity_without_network() {
+        let temp = tempfile::tempdir().unwrap();
+        let accounts = AgentAccounts::new(AgentAccountsConfig::isolated(temp.path()));
+        let first = serde_json::json!({"access_token":"old", "refresh_token":"same-refresh", "account_id":"stable-account"});
+        accounts
+            .write_keyed_entry(HarnessId::Symphony, "anthropic", Some(&first))
+            .unwrap();
+        let snapshot = accounts.list(false).await.unwrap();
+        let id = snapshot.accounts[0].id.clone();
+        let refreshed = serde_json::json!({"access_token":"new", "refresh_token":"same-refresh"});
+        accounts
+            .write_keyed_entry(HarnessId::Symphony, "anthropic", Some(&refreshed))
+            .unwrap();
+        let snapshot = accounts.list(false).await.unwrap();
+        assert_eq!(snapshot.accounts.len(), 1);
+        assert_eq!(snapshot.accounts[0].id, id);
+        assert!(snapshot.accounts[0].active);
+    }
 }

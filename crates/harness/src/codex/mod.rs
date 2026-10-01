@@ -635,11 +635,13 @@ impl Harness for CodexHarness {
     async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
         Ok(vec![
             SlashCommand {
+                options: vec![],
                 name: "compact".into(),
                 description: "Compact this conversation's context".into(),
                 input_hint: None,
             },
             SlashCommand {
+                options: vec![],
                 name: "review".into(),
                 description: "Review uncommitted changes, or supply review instructions".into(),
                 input_hint: Some("optional instructions".into()),

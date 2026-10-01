@@ -224,6 +224,20 @@ impl AgentAccounts {
         };
         let key = slot.store_key.as_deref().ok_or(missing.clone())?;
         let creds = &slot.credentials;
+        if harness == HarnessId::Symphony {
+            let access = str_field(creds, "access_token").ok_or(missing)?;
+            return match key {
+                "openai" => {
+                    let account = str_field(creds, "account_id").unwrap_or_default();
+                    self.openai_usage("symphony", &access, &account).await
+                }
+                "anthropic" => self.claude_usage_request(&access).await,
+                "grok" => self.grok_usage_request(&access).await,
+                _ => Err(ProbeError::NoCredentials {
+                    why: NoCredentials::Unsupported,
+                }),
+            };
+        }
         if harness == HarnessId::Hermes {
             if str_field(creds, "auth_type").as_deref() == Some("api_key") {
                 return Err(ProbeError::NoCredentials {

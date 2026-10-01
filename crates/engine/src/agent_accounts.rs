@@ -13,6 +13,7 @@
 //! | Devin    | yes    | yes    | ACP `authenticate` (loopback)  | yes   |
 //! | OpenCode | yes    | yes    | ChatGPT loopback, Copilot code | yes   |
 //! | Pi       | yes    | yes    | ChatGPT loopback               | yes   |
+//! | Symphony | yes    | yes    | ChatGPT, Claude paste, Grok code | yes |
 //! | Hermes   | yes    | no¹    | `hermes auth add` (device code) | yes  |
 //!
 //! ¹ Hermes keeps every account in its own credential pool and rotates
@@ -98,6 +99,7 @@ mod oauth;
 #[cfg(test)]
 mod provider_tests;
 mod stores;
+mod symphony;
 mod usage;
 
 // Claude Code's public OAuth client (the one the CLI itself uses for the manual
@@ -191,6 +193,8 @@ pub struct AgentAccountsConfig {
     /// Pi's agent dir (`$PI_CODING_AGENT_DIR`, default `~/.pi/agent`) —
     /// holds `auth.json`.
     pub pi_agent_dir: PathBuf,
+    /// Symphony home — per-provider OAuth files and `.env`.
+    pub symphony_home: PathBuf,
     /// Hermes' `HERMES_HOME` (default `~/.hermes`) — holds `auth.json`.
     pub hermes_home: PathBuf,
 }
@@ -225,6 +229,7 @@ impl AgentAccountsConfig {
             devin_credentials_file: stores::default_devin_credentials_file(),
             opencode_auth_file: stores::default_opencode_auth_file(),
             pi_agent_dir: stores::default_pi_agent_dir(),
+            symphony_home: zeron_harness::SymphonyHarness::credential_home(),
             hermes_home: stores::default_hermes_home(),
         }
     }
@@ -246,6 +251,7 @@ impl AgentAccountsConfig {
             devin_credentials_file: root.join("devin").join("credentials.toml"),
             opencode_auth_file: root.join("opencode").join("auth.json"),
             pi_agent_dir: root.join("pi"),
+            symphony_home: root.join("symphony"),
             hermes_home: root.join("hermes"),
         }
     }
@@ -394,6 +400,11 @@ impl Detected {
 // ── login flows ─────────────────────────────────────────────────────────────
 
 enum LoginFlow {
+    SymphonyPaste {
+        verifier: String,
+        state: String,
+        started_at: Instant,
+    },
     Claude {
         verifier: String,
         /// The OAuth `state`, random and separate from the PKCE verifier (a
@@ -463,6 +474,7 @@ impl LoginFlow {
     fn started_at(&self) -> Instant {
         match self {
             LoginFlow::Claude { started_at, .. }
+            | LoginFlow::SymphonyPaste { started_at, .. }
             | LoginFlow::Spawned { started_at, .. }
             | LoginFlow::Task { started_at, .. } => *started_at,
         }
@@ -661,6 +673,9 @@ struct ProbeEndpoints {
     /// Where the loopback login redeems its code (and reads the profile).
     claude_loopback_token: String,
     claude_profile: String,
+    symphony_anthropic_token: String,
+    symphony_xai_device: String,
+    symphony_xai_token: String,
     codex_usage: String,
     /// Grok's billing view (`/v1/billing?format=credits`).
     grok_usage: String,
@@ -689,6 +704,9 @@ impl Default for ProbeEndpoints {
             claude_token: CLAUDE_TOKEN_URL.into(),
             claude_loopback_token: CLAUDE_LOOPBACK_TOKEN_URL.into(),
             claude_profile: CLAUDE_PROFILE_URL.into(),
+            symphony_anthropic_token: "https://api.anthropic.com/v1/oauth/token".into(),
+            symphony_xai_device: "https://auth.x.ai/oauth2/device/code".into(),
+            symphony_xai_token: "https://auth.x.ai/oauth2/token".into(),
             codex_usage: CODEX_USAGE_URL.into(),
             grok_usage: usage::GROK_USAGE_URL.into(),
             github_api: "https://api.github.com".into(),
@@ -922,6 +940,12 @@ impl AgentAccounts {
         let mut detected_more: Vec<(HarnessId, Detected)> = Vec::new();
         detected_more.extend(self.detect_grok().map(|d| (HarnessId::Grok, d)));
         detected_more.extend(self.detect_devin().map(|d| (HarnessId::Devin, d)));
+        detected_more.extend(
+            self.detect_symphony()
+                .await
+                .into_iter()
+                .map(|d| (HarnessId::Symphony, d)),
+        );
         for harness in [HarnessId::Opencode, HarnessId::Pi] {
             let (resolved, unresolved) = self.detect_keyed(harness).await;
             detected_more.extend(resolved.into_iter().map(|d| (harness, d)));
@@ -953,6 +977,7 @@ impl AgentAccounts {
             HarnessId::Devin,
             HarnessId::Opencode,
             HarnessId::Pi,
+            HarnessId::Symphony,
         ]
         .into_iter()
         .map(|harness| (harness, self.read_slots(harness)))
@@ -1103,7 +1128,7 @@ impl AgentAccounts {
                 self.write_grok_entry(slot.store_key.as_deref(), &slot.credentials)?
             }
             HarnessId::Devin => self.write_devin_credentials(&slot.credentials)?,
-            HarnessId::Opencode | HarnessId::Pi => {
+            HarnessId::Opencode | HarnessId::Pi | HarnessId::Symphony => {
                 let key = slot.store_key.as_deref().ok_or_else(|| {
                     EngineError::Other("That saved login names no provider.".into())
                 })?;
@@ -1200,7 +1225,7 @@ impl AgentAccounts {
             HarnessId::Cursor => self.detect_cursor().map(|d| d.account_key),
             HarnessId::Grok => self.detect_grok().map(|d| d.account_key),
             HarnessId::Devin => self.detect_devin().map(|d| d.account_key),
-            HarnessId::Opencode | HarnessId::Pi => self
+            HarnessId::Opencode | HarnessId::Pi | HarnessId::Symphony => self
                 .detect_keyed_entry(harness, store_key?)
                 .await
                 .flatten()
@@ -1214,7 +1239,7 @@ impl AgentAccounts {
     /// never replaced unasked.
     fn has_live_entry(&self, harness: HarnessId, store_key: Option<&str>) -> bool {
         match harness {
-            HarnessId::Opencode | HarnessId::Pi => {
+            HarnessId::Opencode | HarnessId::Pi | HarnessId::Symphony => {
                 store_key.is_none_or(|key| self.live_keyed_entry(harness, key).is_some())
             }
             _ => false,
@@ -1242,7 +1267,7 @@ impl AgentAccounts {
             HarnessId::Cursor => self.write_cursor_auth(&slot.credentials)?,
             HarnessId::Grok => self.write_grok_entry(store_key, &slot.credentials)?,
             HarnessId::Devin => self.write_devin_credentials(&slot.credentials)?,
-            HarnessId::Opencode | HarnessId::Pi => {
+            HarnessId::Opencode | HarnessId::Pi | HarnessId::Symphony => {
                 if let Some(key) = store_key {
                     self.write_keyed_entry(slot.harness, key, Some(&slot.credentials))?;
                 }
@@ -1312,7 +1337,7 @@ impl AgentAccounts {
                 self.remove_grok_entry(&map_key)?;
             }
             HarnessId::Devin => remove_if_exists(&self.inner.config.devin_credentials_file)?,
-            HarnessId::Opencode | HarnessId::Pi => {
+            HarnessId::Opencode | HarnessId::Pi | HarnessId::Symphony => {
                 let key = store_key
                     .ok_or_else(|| EngineError::Other("That login names no provider.".into()))?;
                 self.write_keyed_entry(harness, key, None)?;
@@ -1444,6 +1469,10 @@ impl AgentAccounts {
                 }
                 other => return Err(stores::unsupported_login(harness, other)),
             },
+            HarnessId::Symphony => {
+                self.start_symphony_login(provider.unwrap_or("openai"))
+                    .await?
+            }
             HarnessId::Hermes => {
                 let provider = provider.unwrap_or("openai-codex");
                 if !stores::HERMES_LOGINS.contains(&provider) {
@@ -1868,6 +1897,10 @@ impl AgentAccounts {
         login_id: &str,
         code: &str,
     ) -> Result<AgentAccountsSnapshot, EngineError> {
+        if let Some(result) = self.complete_symphony_paste_login(login_id, code).await {
+            result?;
+            return self.list(false).await;
+        }
         let (verifier, expected_state) = match lock(&self.inner.flows).get(login_id) {
             Some(LoginFlow::Claude {
                 verifier, state, ..
@@ -2068,7 +2101,7 @@ impl AgentAccounts {
                         "This sign-in attempt expired — start again.".into(),
                     ));
                 }
-                Some(LoginFlow::Claude { .. }) => {
+                Some(LoginFlow::Claude { .. } | LoginFlow::SymphonyPaste { .. }) => {
                     return Ok(AgentLoginPoll {
                         status: AgentLoginStatus::Pending,
                         message: None,
@@ -2658,7 +2691,7 @@ impl AgentAccounts {
             HarnessId::Cursor => self.cursor_usage(slot).await,
             HarnessId::Grok => self.grok_usage(slot, is_active).await,
             HarnessId::Devin => self.devin_usage(slot).await,
-            HarnessId::Opencode | HarnessId::Pi | HarnessId::Hermes => {
+            HarnessId::Opencode | HarnessId::Pi | HarnessId::Hermes | HarnessId::Symphony => {
                 self.keyed_usage(harness, slot).await
             }
             _ => Err(ProbeError::NoCredentials {
@@ -3086,7 +3119,7 @@ async fn antigravity_keychain_item(_account: &str) -> bool {
 fn provider_group(harness: HarnessId, store_key: Option<&str>) -> Option<String> {
     matches!(
         harness,
-        HarnessId::Opencode | HarnessId::Pi | HarnessId::Hermes
+        HarnessId::Opencode | HarnessId::Pi | HarnessId::Hermes | HarnessId::Symphony
     )
     .then(|| store_key.map(str::to_string))
     .flatten()

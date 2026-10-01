@@ -358,6 +358,7 @@ fn parse_initialize_commands(response: &Value) -> Vec<SlashCommand> {
                 return None;
             }
             Some(SlashCommand {
+                options: vec![],
                 name: name.to_owned(),
                 description: c
                     .get("description")

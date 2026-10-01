@@ -1494,6 +1494,13 @@ fn enter_outcome(has_completion: bool, fallback: EnterOutcome) -> EnterOutcome {
     }
 }
 
+/// True while a composer picker menu is interactive. Enter selects that row
+/// and must not be inserted into the draft or the filter.
+fn picker_menu_open(cx: &App) -> bool {
+    cx.try_global::<crate::pickers::PickerOpen>()
+        .is_some_and(|open| open.0)
+}
+
 fn input_bindings(context: &'static str) -> Vec<KeyBinding> {
     let ctx = Some(context);
     let mut bindings = vec![
@@ -2902,6 +2909,9 @@ impl ComposerInput {
     }
 
     fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
+        if picker_menu_open(cx) {
+            return;
+        }
         if self.mentions_enabled && self.selected_range.is_empty() && self.marked_range.is_none() {
             if let Some((range, inserted)) =
                 composer_markdown::newline_edit(&self.content, self.cursor_offset())
@@ -2926,6 +2936,9 @@ impl ComposerInput {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if picker_menu_open(cx) {
+            return;
+        }
         match enter_outcome(self.mention_has_selection, EnterOutcome::Newline) {
             EnterOutcome::AcceptCompletion => cx.emit(ComposerInputEvent::MentionAccept),
             EnterOutcome::Newline => self.newline(&Newline, window, cx),
@@ -2934,6 +2947,9 @@ impl ComposerInput {
     }
 
     fn submit(&mut self, _: &Submit, _: &mut Window, cx: &mut Context<Self>) {
+        if picker_menu_open(cx) {
+            return;
+        }
         match enter_outcome(self.mention_has_selection, EnterOutcome::Submit) {
             EnterOutcome::AcceptCompletion => cx.emit(ComposerInputEvent::MentionAccept),
             EnterOutcome::Submit => cx.emit(ComposerInputEvent::Submitted),
@@ -3929,6 +3945,15 @@ impl EntityInputHandler for ComposerInput {
         if self.read_only {
             return;
         }
+        // Palette filters use Enter to select a row. Linux/Windows insert an
+        // unbound Enter as "\n" after the menu consumes the keystroke, which
+        // put the pick into the filter instead of committing it.
+        if self.key_context == PALETTE_SEARCH_CONTEXT
+            && self.marked_range.is_none()
+            && new_text.chars().all(|ch| ch == '\n' || ch == '\r')
+        {
+            return;
+        }
         let single_line_text;
         let new_text = if self.single_line {
             single_line_text = new_text.replace(['\r', '\n'], " ");
@@ -3975,6 +4000,15 @@ impl EntityInputHandler for ComposerInput {
         cx: &mut Context<Self>,
     ) {
         if self.read_only {
+            return;
+        }
+        // Enter is a menu accelerator, not draft text. Platform input handlers
+        // insert an unbound Enter as "\n" after key dispatch; while a picker
+        // is open that character must not land in the composer.
+        if self.marked_range.is_none()
+            && new_text.chars().all(|ch| ch == '\n' || ch == '\r')
+            && picker_menu_open(cx)
+        {
             return;
         }
         let single_line_text;
@@ -4959,6 +4993,9 @@ pub enum WorkspaceCommand {
     Terminal,
     Rename,
     Stop,
+    Clear,
+    Quit,
+    Accounts,
 }
 
 impl WorkspaceCommand {
@@ -4992,6 +5029,50 @@ impl WorkspaceCommand {
     }
 }
 
+/// Argument completion applies only to a single leading command. Canonical
+/// references are decoded without ever putting an argument into its identity.
+fn command_argument_token(text: &str, cursor: usize) -> Option<(MentionToken, String)> {
+    if cursor > text.len() || !text.is_char_boundary(cursor) {
+        return None;
+    }
+    let start = text.len() - text.trim_start_matches([' ', '\t']).len();
+    let tail = &text[start..];
+    let links = zeron_proto::invocation::invocation_links(tail);
+    let (end, name) = if let Some((range, zeron_proto::invocation::Invocation::Command { name })) =
+        links.first()
+    {
+        if range.start != 0 {
+            return None;
+        }
+        (start + range.end, name.clone())
+    } else {
+        let command = tail.strip_prefix('/')?;
+        let length = command.find(char::is_whitespace)?;
+        let name = &command[..length];
+        if !zeron_proto::invocation::valid_invocation_name(name) {
+            return None;
+        }
+        (start + 1 + length, name.to_string())
+    };
+    if cursor <= end || !text[end..].starts_with(char::is_whitespace) {
+        return None;
+    }
+    let argument = text[end..cursor].trim_start();
+    if argument.chars().any(char::is_whitespace) || text[end..].contains('\n') {
+        return None;
+    }
+    let end = text[cursor..]
+        .find(char::is_whitespace)
+        .map_or(text.len(), |length| cursor + length);
+    Some((
+        MentionToken {
+            range: start..end,
+            query: argument.into(),
+        },
+        name,
+    ))
+}
+
 fn with_workspace_commands(
     mut rows: Vec<InvocationCandidate>,
     in_chat: bool,
@@ -5008,6 +5089,8 @@ fn with_workspace_commands(
             name = format!("zeron:{name}");
         }
         rows.push(InvocationCandidate {
+            options: vec![],
+            argument: None,
             invocation: zeron_proto::invocation::Invocation::Command { name: name.clone() },
             name,
             description: description.into(),
@@ -5016,6 +5099,27 @@ fn with_workspace_commands(
         });
     }
     rows
+}
+
+fn route_symphony_commands(candidates: &mut [InvocationCandidate]) {
+    for candidate in candidates {
+        match candidate.name.as_str() {
+            "provider" => {
+                candidate.workspace_command = Some(WorkspaceCommand::Accounts);
+                candidate.description = "Open provider accounts in Zeron settings".into();
+            }
+            "clear" => {
+                candidate.workspace_command = Some(WorkspaceCommand::Clear);
+                candidate.description =
+                    "Clear this window's view; saved conversation is kept".into();
+            }
+            "quit" => {
+                candidate.workspace_command = Some(WorkspaceCommand::Quit);
+                candidate.description = "Quit Zeron safely".into();
+            }
+            _ => {}
+        }
+    }
 }
 
 fn workspace_command_for_text(
@@ -5038,6 +5142,8 @@ struct InvocationCandidate {
     name: String,
     description: String,
     input_hint: Option<String>,
+    options: Vec<zeron_proto::SlashCommandOption>,
+    argument: Option<String>,
     invocation: zeron_proto::invocation::Invocation,
 }
 
@@ -5159,6 +5265,8 @@ fn invocation_candidates(
         .map(|c| InvocationCandidate {
             workspace_command: None,
             input_hint: c.input_hint,
+            options: c.options,
+            argument: None,
             name: c.name.clone(),
             description: c.description,
             invocation: zeron_proto::invocation::Invocation::Command { name: c.name },
@@ -5168,6 +5276,8 @@ fn invocation_candidates(
                 .into_iter()
                 .filter(|s| s.enabled)
                 .map(|s| InvocationCandidate {
+                    options: vec![],
+                    argument: None,
                     workspace_command: None,
                     input_hint: None,
                     name: s.name.clone(),
@@ -6809,12 +6919,95 @@ impl Composer {
 
     /// Track the `/` token on every edit: open/refresh the popup, fetch the
     /// harness's command list on each open, filter locally per keystroke.
+    fn update_command_arguments(
+        &mut self,
+        text: &str,
+        cursor: usize,
+        harness: Option<HarnessId>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.slash.harness != harness {
+            return false;
+        }
+        let preferences =
+            crate::settings::current(cx).skill_completion(harness.unwrap_or(HarnessId::Codex));
+        let identity = format!(
+            "{preferences:?}:{}:{}",
+            self.completion_connection_context(cx),
+            self.catalog_params(cx)
+        );
+        if !self.slash.catalog_context.is_empty() && self.slash.catalog_context != identity {
+            return false;
+        }
+        let Some((token, name)) = command_argument_token(text, cursor) else {
+            return false;
+        };
+        let Some(command) = self
+            .slash_cache
+            .values()
+            .flat_map(|rows| rows.iter())
+            .find(|row| row.argument.is_none() && row.name == name && !row.options.is_empty())
+            .cloned()
+        else {
+            return false;
+        };
+        let context = format!("arguments:{}:{name}", self.slash.catalog_context);
+        if self.slash.context == context && self.slash.token.as_ref() == Some(&token) {
+            return true;
+        }
+        if self.slash.dismissed.as_ref().is_some_and(|(range, value)| {
+            *range == token.range && text.get(range.clone()) == Some(value.as_str())
+        }) {
+            return true;
+        }
+        let rows = command
+            .options
+            .iter()
+            .map(|option| InvocationCandidate {
+                workspace_command: None,
+                name: option.value.clone(),
+                description: if option.label.is_empty() {
+                    option.description.clone()
+                } else {
+                    format!("{} — {}", option.label, option.description)
+                },
+                input_hint: None,
+                options: vec![],
+                argument: Some(option.value.clone()),
+                invocation: command.invocation.clone(),
+            })
+            .collect();
+        self.slash.request = self.slash.request.wrapping_add(1);
+        self.slash_task = None;
+        self.slash.context = context.clone();
+        self.slash.token = Some(token);
+        self.slash.skill = false;
+        self.slash.loading = false;
+        self.slash.error = None;
+        self.slash.dismissed = None;
+        self.slash_cache.insert(context, rows);
+        self.refilter_slash(cx);
+        true
+    }
+
     fn update_slash(&mut self, text: &str, cursor: usize, cx: &mut Context<Self>) {
         let harness = self.pickers.read(cx).resolved(cx).harness;
         let preferences =
             crate::settings::current(cx).skill_completion(harness.unwrap_or(HarnessId::Codex));
-        let (token, skill, include_skills, commands_allowed) =
+        let (mut token, skill, include_skills, mut commands_allowed) =
             completion_trigger(text, cursor, preferences);
+        if token.is_none() && self.update_command_arguments(text, cursor, harness, cx) {
+            return;
+        }
+        if token.is_none() {
+            if let Some((argument, name)) = command_argument_token(text, cursor) {
+                token = Some(MentionToken {
+                    range: argument.range,
+                    query: name,
+                });
+                commands_allowed = true;
+            }
+        }
         if token.is_none() {
             // Leaving a token must not replace the catalog identity with the
             // idle (commands_allowed=false) context and evict the warm cache.
@@ -6949,6 +7142,10 @@ impl Composer {
                         } else {
                             candidates
                         };
+                        let mut candidates = candidates;
+                        if harness == Some(HarnessId::Symphony) {
+                            route_symphony_commands(&mut candidates);
+                        }
                         composer.slash_cache.insert(context, candidates);
                     }
                     Err(err) => {
@@ -6974,6 +7171,14 @@ impl Composer {
 
     /// Re-rank the cached list for the current query (pure local filter).
     fn refilter_slash(&mut self, cx: &mut Context<Self>) {
+        if !self.slash.context.starts_with("arguments:") {
+            let input = self.input.read(cx);
+            let text = input.text().to_string();
+            let cursor = input.cursor_offset();
+            if self.update_command_arguments(&text, cursor, self.slash.harness, cx) {
+                return;
+            }
+        }
         let query = self
             .slash
             .token
@@ -7038,12 +7243,22 @@ impl Composer {
             self.execute_workspace_command(action, token.range, cx);
             return;
         }
-        let insertion =
+        let mut insertion =
             invocation_insertion(&command.invocation, self.reference_delivery_supported(cx));
+        if let Some(argument) = &command.argument {
+            insertion.push(' ');
+            insertion.push_str(argument);
+        }
         self.input.update(cx, |input, cx| {
             input.replace_plain_token(token.range, &insertion, cx)
         });
         self.reset_slash(None, cx);
+        if command.argument.is_none() && !command.options.is_empty() {
+            let input = self.input.read(cx);
+            let text = input.text().to_string();
+            let cursor = input.cursor_offset();
+            self.update_command_arguments(&text, cursor, self.slash.harness, cx);
+        }
         cx.notify();
     }
 
@@ -7153,7 +7368,11 @@ impl Composer {
                 let name: SharedString = if command.invocation.prefix() == '$' {
                     skill_display_name(&command.name)
                 } else {
-                    format!("/{}", command.name)
+                    if command.argument.is_some() {
+                        command.name.clone()
+                    } else {
+                        format!("/{}", command.name)
+                    }
                 }
                 .into();
                 let mut description = command.description.clone();
@@ -7517,9 +7736,10 @@ impl Composer {
                 self.reset_slash(None, cx);
                 self.failure = None;
             } else {
-                self.failure = Some(format!(
-                    "Unknown Symphony model: {model_id}. Open /model to choose one."
-                ));
+                self.failure = Some(
+                    format!("Unknown Symphony model: {model_id}. Open /model to choose one.")
+                        .into(),
+                );
             }
             cx.notify();
             return;
@@ -7595,6 +7815,20 @@ impl Composer {
         // worktree / fresh worktree off the picked base) — resolved NOW so
         // the async block needs no picker access.
         let plan = self.pickers.read(cx).checkout_plan();
+        if self.pickers.read(cx).resolved(cx).harness == Some(HarnessId::Symphony) {
+            let prompt = zeron_proto::invocation::invocation_prompt(&text);
+            let mut words = prompt.split_whitespace();
+            if words.next() == Some("/effort") {
+                if let Some(effort) = words.next().map(str::to_lowercase) {
+                    if words.next().is_none()
+                        && matches!(effort.as_str(), "default" | "none" | "low" | "medium" | "high" | "xhigh" | "max")
+                        && self.staged().is_empty() && self.staged_appshots().is_empty()
+                    {
+                        self.pickers.update(cx, |pickers, cx| pickers.select_symphony_effort_command(&effort, cx));
+                    }
+                }
+            }
+        }
         // Fully-resolved model/reasoning/options — concrete values (chat config
         // or defaults), so the engine never has to guess a "default".
         let resolved = self.pickers.read(cx).resolved(cx);
@@ -8859,8 +9093,13 @@ impl Render for Composer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.focus_pending {
             self.focus_pending = false;
-            let focus = self.input.focus_handle(cx);
-            window.focus(&focus, cx);
+            // An open picker owns the keyboard. Reclaiming the draft here
+            // (shell focus recovery, route changes) is what made Enter insert
+            // the keystroke into the composer instead of selecting the row.
+            if !self.pickers.read(cx).is_open() {
+                let focus = self.input.focus_handle(cx);
+                window.focus(&focus, cx);
+            }
         }
         let theme = Theme::of(cx).clone();
         let wizard_active = self.wizard.is_some();
@@ -10323,11 +10562,13 @@ mod tests {
         let native = invocation_candidates(
             vec![
                 SlashCommand {
+                    options: vec![],
                     name: "model".into(),
                     description: "Native model command".into(),
                     input_hint: Some("model id".into()),
                 },
                 SlashCommand {
+                    options: vec![],
                     name: "zeron:model".into(),
                     description: "Plugin command".into(),
                     input_hint: None,
@@ -10461,6 +10702,8 @@ mod tests {
                     composer.slash_cache.insert(
                         composer.slash.context.clone(),
                         vec![InvocationCandidate {
+                            options: vec![],
+                            argument: None,
                             name: "review".into(),
                             description: String::new(),
                             input_hint: None,
@@ -12538,6 +12781,7 @@ mod tests {
     #[test]
     fn partial_discovery_keeps_commands_and_skills_independently() {
         let command = SlashCommand {
+            options: vec![],
             name: "review".into(),
             description: String::new(),
             input_hint: None,
@@ -12610,6 +12854,112 @@ mod tests {
     }
 
     #[test]
+    fn symphony_native_commands_route_to_safe_zeron_actions() {
+        let mut rows = invocation_candidates(
+            ["provider", "clear", "quit", "status"]
+                .into_iter()
+                .map(|name| SlashCommand {
+                    name: name.into(),
+                    description: String::new(),
+                    input_hint: None,
+                    options: vec![],
+                })
+                .collect(),
+            vec![],
+        );
+        route_symphony_commands(&mut rows);
+        assert_eq!(
+            workspace_command_for_text("/provider", &rows),
+            Some(WorkspaceCommand::Accounts)
+        );
+        assert_eq!(
+            workspace_command_for_text("/clear", &rows),
+            Some(WorkspaceCommand::Clear)
+        );
+        assert_eq!(
+            workspace_command_for_text("/quit", &rows),
+            Some(WorkspaceCommand::Quit)
+        );
+        assert_eq!(workspace_command_for_text("/status", &rows), None);
+    }
+
+    #[test]
+    fn command_arguments_keep_command_identity_and_replace_the_whole_argument() {
+        use zeron_proto::invocation::Invocation;
+        for prefix in [
+            "/personality".to_string(),
+            Invocation::Command {
+                name: "personality".into(),
+            }
+            .link(),
+        ] {
+            let text = format!("{prefix} precise");
+            let cursor = prefix.len() + 4;
+            let (token, name) = command_argument_token(&text, cursor).unwrap();
+            assert_eq!(name, "personality");
+            assert_eq!(token.query, "pre");
+            assert_eq!(token.range, 0..text.len());
+        }
+        for text in [
+            "please /personality ",
+            "/personality precise extra",
+            "`/personality ",
+            "/personality\n",
+        ] {
+            assert!(command_argument_token(text, text.len()).is_none(), "{text}");
+        }
+    }
+
+    #[gpui::test]
+    fn personality_argument_picker_inserts_argument_not_command_name(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (_dir, handle) = composer_focus_window(cx);
+        handle
+            .update(cx, |composer, _, cx| {
+                let rows = invocation_candidates(
+                    vec![SlashCommand {
+                        name: "personality".into(),
+                        description: "Choose personality".into(),
+                        input_hint: Some("id".into()),
+                        options: vec![zeron_proto::SlashCommandOption {
+                            value: "precise".into(),
+                            label: "Precise".into(),
+                            description: "Exact and careful".into(),
+                        }],
+                    }],
+                    vec![],
+                );
+                composer.slash_cache.insert("catalog".into(), rows);
+                composer.input.update(cx, |input, cx| input.set_text("/personality", cx));
+                composer.slash.context = "catalog".into();
+                composer.slash.token = Some(MentionToken { range: 0..12, query: "personality".into() });
+                composer.slash.filtered = vec![0];
+                composer.slash.active = Some(0);
+                composer.accept_slash(cx);
+                assert!(composer.slash.context.starts_with("arguments:"));
+                assert_eq!(composer.slash.filtered.len(), 1);
+                composer
+                    .input
+                    .update(cx, |input, cx| input.set_text("/personality ", cx));
+                assert!(composer.update_command_arguments(
+                    "/personality ",
+                    13,
+                    composer.slash.harness,
+                    cx
+                ));
+                assert_eq!(composer.slash.filtered.len(), 1);
+                composer.accept_slash(cx);
+                let text = composer.input.read(cx).text();
+                assert_eq!(
+                    zeron_proto::invocation::invocation_prompt(text).trim(),
+                    "/personality precise"
+                );
+            })
+            .unwrap();
+    }
+
+    #[test]
     fn every_harness_respects_both_skill_completion_toggles() {
         use crate::settings::SkillCompletionSettings;
         for (harness, _) in crate::settings::SKILL_COMPLETION_HARNESSES {
@@ -12642,6 +12992,7 @@ mod tests {
             let commands = ["review", "bad\ncommand", "two words"]
                 .into_iter()
                 .map(|name| SlashCommand {
+                    options: vec![],
                     name: name.into(),
                     description: String::new(),
                     input_hint: None,
@@ -12686,11 +13037,13 @@ mod tests {
         for (harness, _) in crate::settings::SKILL_COMPLETION_HARNESSES {
             let commands = vec![
                 SlashCommand {
+                    options: vec![],
                     name: "review".into(),
                     description: String::new(),
                     input_hint: None,
                 },
                 SlashCommand {
+                    options: vec![],
                     name: "compact".into(),
                     description: String::new(),
                     input_hint: None,
@@ -12723,6 +13076,7 @@ mod tests {
     fn combined_invocations_preserve_skill_identity_and_command_collisions() {
         use zeron_proto::invocation::{Invocation, Skill};
         let commands = vec![SlashCommand {
+            options: vec![],
             name: "review".into(),
             description: "Command".into(),
             input_hint: None,

@@ -11963,6 +11963,11 @@ impl Render for Shell {
                 WorkspaceCommand::New => self.open_new_session(cx),
                 WorkspaceCommand::Resume => self.toggle_command_palette(window, cx),
                 WorkspaceCommand::Settings => self.open_last_settings(cx),
+                WorkspaceCommand::Accounts => self.open_settings(SettingsSection::Harnesses, cx),
+                WorkspaceCommand::Clear => self
+                    .transcript
+                    .update(cx, |transcript, cx| transcript.clear_view(cx)),
+                WorkspaceCommand::Quit => crate::app_menus::request_quit(cx),
                 WorkspaceCommand::Diff if !self.active_chat.is_empty() => {
                     self.add_diff_surface(window, cx)
                 }

@@ -434,6 +434,7 @@ mod tests {
             probes.set(probes.get() + 1);
             tokio::task::yield_now().await;
             Ok(vec![zeron_proto::SlashCommand {
+                options: vec![],
                 name: format!("probe-{}", probes.get()),
                 description: String::new(),
                 input_hint: None,
@@ -552,11 +553,13 @@ mod tests {
     fn acp_native_skill_commands_remain_distinct_from_builtin_commands() {
         let commands = vec![
             zeron_proto::SlashCommand {
+                options: vec![],
                 name: "skill:review".into(),
                 description: "Review".into(),
                 input_hint: None,
             },
             zeron_proto::SlashCommand {
+                options: vec![],
                 name: "compact".into(),
                 description: String::new(),
                 input_hint: None,
@@ -587,6 +590,7 @@ mod tests {
                 command: None,
             }];
             let command = zeron_proto::SlashCommand {
+                options: vec![],
                 name: "review".into(),
                 description: String::new(),
                 input_hint: None,
@@ -613,6 +617,7 @@ mod tests {
                 command: None,
             }];
             let command = |name: &str| zeron_proto::SlashCommand {
+                options: vec![],
                 name: name.into(),
                 description: String::new(),
                 input_hint: None,
@@ -639,6 +644,7 @@ mod tests {
         ]
         .into_iter()
         .map(|name| zeron_proto::SlashCommand {
+            options: vec![],
             name: name.into(),
             description: String::new(),
             input_hint: None,

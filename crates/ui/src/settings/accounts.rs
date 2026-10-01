@@ -121,7 +121,9 @@ pub fn is_openable_login_url(url: &str) -> bool {
         "https" => true,
         "http" => {
             let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-            let authority = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+            let authority = authority
+                .rsplit_once('@')
+                .map_or(authority, |(_, host)| host);
             let host = match authority.strip_prefix('[') {
                 Some(v6) => v6.split(']').next().unwrap_or(""),
                 None => authority.split(':').next().unwrap_or(""),
@@ -162,7 +164,7 @@ pub fn format_reset(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Opt
 /// command — named in the empty-state copy, zeron settings.agents.tsx
 /// `PROVIDERS`). Every agent with a login of its own is here; what each one
 /// supports is documented engine-side (`agent_accounts` module docs).
-pub const PROVIDERS: [(HarnessId, &str, &str); 9] = [
+pub const PROVIDERS: [(HarnessId, &str, &str); 10] = [
     (HarnessId::ClaudeCode, "Claude Code", "claude"),
     (HarnessId::Codex, "Codex", "codex"),
     (HarnessId::Cursor, "Cursor", "cursor-agent"),
@@ -172,6 +174,7 @@ pub const PROVIDERS: [(HarnessId, &str, &str); 9] = [
     (HarnessId::Opencode, "OpenCode", "opencode auth login"),
     (HarnessId::Pi, "Pi", "pi"),
     (HarnessId::Hermes, "Hermes", "hermes auth add"),
+    (HarnessId::Symphony, "Symphony", "symphony"),
 ];
 
 /// Whether `harness` has an Accounts section (and sign-in flow). Pure.
@@ -212,6 +215,10 @@ pub fn switches_accounts(harness: HarnessId) -> bool {
 /// its entries. Pure.
 pub fn provider_note(harness: HarnessId) -> Option<&'static str> {
     match harness {
+        HarnessId::Symphony => Some(
+            "Symphony stores its own credentials per provider, separate from other agents. \
+             Switching an account only changes the active login for that provider.",
+        ),
         HarnessId::Hermes => Some(
             "Hermes manages its own credential pool and rotates through it. Accounts added \
              here go through `hermes auth add`; remove one with `hermes auth remove`.",
@@ -221,7 +228,7 @@ pub fn provider_note(harness: HarnessId) -> Option<&'static str> {
 }
 
 /// One way to add an account: agents that keep a login PER model provider
-/// (OpenCode, Pi, Hermes) sign in to a named provider; the rest have one.
+/// (OpenCode, Pi, Hermes, Symphony) sign in to a named provider; the rest have one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LoginOption {
     /// The engine's `provider` param (`None` = the agent's only login).
@@ -237,6 +244,16 @@ pub fn login_options(harness: HarnessId) -> Vec<LoginOption> {
         label,
     };
     match harness {
+        HarnessId::Symphony => vec![
+            option("openai", "ChatGPT"),
+            option("anthropic", "Claude"),
+            option("gemini", "Gemini"),
+            option("grok", "Grok"),
+            option("openrouter", "OpenRouter"),
+            option("vercel", "Vercel"),
+            option("ollama", "Ollama"),
+            option("local", "Local"),
+        ],
         HarnessId::Opencode => vec![
             option("openai", "ChatGPT"),
             option("github-copilot", "GitHub Copilot"),
@@ -276,6 +293,38 @@ pub fn add_option_label(harness: HarnessId, option: LoginOption, empty: bool) ->
 /// per provider, same shape. Pure.
 fn login_copy(harness: HarnessId, provider: Option<&str>) -> &'static str {
     match (harness, provider) {
+        (HarnessId::Symphony, Some("openai")) => {
+            "Finish signing in to ChatGPT in your browser. Symphony saves its own OAuth login — \
+             nothing changes until you switch this provider's account."
+        }
+        (HarnessId::Symphony, Some("anthropic")) => {
+            "Run `claude setup-token`, then paste the Claude setup token below. Symphony saves \
+             its own credentials — nothing changes until you switch this provider's account."
+        }
+        (HarnessId::Symphony, Some("grok")) => {
+            "Finish signing in to Grok in your browser — approve the code shown below. Symphony \
+             saves its own OAuth login — nothing changes until you switch this provider's account."
+        }
+        (HarnessId::Symphony, Some("gemini")) => {
+            "Paste a Gemini API key below. Symphony stores it separately — nothing changes until \
+             you switch this provider's account."
+        }
+        (HarnessId::Symphony, Some("openrouter")) => {
+            "Paste an OpenRouter API key below. Symphony stores it separately — nothing changes \
+             until you switch this provider's account."
+        }
+        (HarnessId::Symphony, Some("vercel")) => {
+            "Paste a Vercel AI Gateway API key below. Symphony stores it separately — nothing \
+             changes until you switch this provider's account."
+        }
+        (HarnessId::Symphony, Some("ollama")) => {
+            "Paste the Ollama server URL below, or submit http://localhost:11434/v1. Symphony \
+             stores it separately from other providers."
+        }
+        (HarnessId::Symphony, Some("local")) => {
+            "Paste the Local server URL below, such as http://127.0.0.1:1234/v1. Symphony stores \
+             it separately from other providers."
+        }
         (HarnessId::ClaudeCode, _) => {
             "Finish signing in to Claude in your browser. The new login is saved next to \
              your current one — nothing changes until you switch."
@@ -527,7 +576,7 @@ impl AccountsPage {
         cx: &mut Context<Self>,
     ) -> Self {
         let observe = cx.observe(&state, |_, _, cx| cx.notify());
-        let code_input = cx.new(|cx| ComposerInput::new("Paste the authorization code", cx));
+        let code_input = cx.new(|cx| ComposerInput::new("Paste the credential", cx));
         let code_events = cx.subscribe(&code_input, |this: &mut Self, _, event, cx| {
             if matches!(event, ComposerInputEvent::Submitted) {
                 this.submit_code(cx);
@@ -1185,7 +1234,10 @@ impl AccountsPage {
         // line, so a failed probe never changes the row's height.
         let usage: AnyElement = if account.usage_windows.is_empty() {
             meta.extend(self.render_usage_missing(account, theme));
-            div().w(px(USAGE_COLUMN_WIDTH)).flex_none().into_any_element()
+            div()
+                .w(px(USAGE_COLUMN_WIDTH))
+                .flex_none()
+                .into_any_element()
         } else {
             let resets = account
                 .usage_windows
@@ -1370,7 +1422,9 @@ impl AccountsPage {
                     .flex_1()
                     .min_w_0()
                     .child(widgets::row_title(theme, email.clone()).truncate())
-                    .when(!meta.is_empty(), |el| el.child(widgets::meta_line(theme, meta))),
+                    .when(!meta.is_empty(), |el| {
+                        el.child(widgets::meta_line(theme, meta))
+                    }),
             )
             .child(usage)
             .child(
@@ -1478,6 +1532,11 @@ impl AccountsPage {
                 .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
         };
         let copy = match login.step {
+            LoginStep::PasteCode { .. } if login.harness == HarnessId::Symphony => {
+                "Paste the token from `claude setup-token`, or approve the Claude browser \
+                 sign-in and paste the full code#state or callback URL. Other providers' \
+                 accounts are left untouched."
+            }
             LoginStep::PasteCode { .. } => {
                 "Your browser opened Claude's sign-in page. Approve access, then paste the \
                  code Anthropic shows you below. Your current login is untouched until you \
@@ -1932,6 +1991,7 @@ impl Render for AccountsPage {
                         HarnessId::Opencode => "accounts-skeleton-opencode",
                         HarnessId::Pi => "accounts-skeleton-pi",
                         HarnessId::Hermes => "accounts-skeleton-hermes",
+                        HarnessId::Symphony => "accounts-skeleton-symphony",
                         _ => "accounts-skeleton-claude",
                     };
                     div()
@@ -2218,7 +2278,9 @@ impl Render for AccountsPage {
 mod tests {
     #[test]
     fn only_web_and_loopback_login_urls_open() {
-        assert!(is_openable_login_url("https://claude.com/cai/oauth/authorize?x=1"));
+        assert!(is_openable_login_url(
+            "https://claude.com/cai/oauth/authorize?x=1"
+        ));
         assert!(is_openable_login_url("http://localhost:1455/auth/callback"));
         assert!(is_openable_login_url("http://127.0.0.1:8080/"));
         assert!(is_openable_login_url("http://[::1]:9000/cb"));
@@ -2371,6 +2433,52 @@ mod tests {
     }
 
     #[test]
+    fn symphony_offers_its_own_provider_accounts() {
+        assert_eq!(PROVIDERS.len(), 10);
+        assert!(signs_in(HarnessId::Symphony));
+        assert!(switches_accounts(HarnessId::Symphony));
+        assert!(!keeps_one_login(HarnessId::Symphony));
+        assert_eq!(provider_name(HarnessId::Symphony), "Symphony");
+        assert!(
+            provider_note(HarnessId::Symphony)
+                .is_some_and(|note| note.contains("own credentials per provider"))
+        );
+        let options = login_options(HarnessId::Symphony);
+        assert_eq!(
+            options,
+            vec![
+                LoginOption { provider: Some("openai"), label: "ChatGPT" },
+                LoginOption { provider: Some("anthropic"), label: "Claude" },
+                LoginOption { provider: Some("gemini"), label: "Gemini" },
+                LoginOption { provider: Some("grok"), label: "Grok" },
+                LoginOption { provider: Some("openrouter"), label: "OpenRouter" },
+                LoginOption { provider: Some("vercel"), label: "Vercel" },
+                LoginOption { provider: Some("ollama"), label: "Ollama" },
+                LoginOption { provider: Some("local"), label: "Local" },
+            ]
+        );
+        for option in options {
+            assert_eq!(
+                add_option_label(HarnessId::Symphony, option, true),
+                format!("Connect {}", option.label)
+            );
+            let flow = LoginFlow {
+                provider: option.provider,
+                ..waiting(HarnessId::Symphony, 1)
+            };
+            assert_eq!(
+                flow.title(),
+                format!("Sign in to {} for Symphony", option.label)
+            );
+            assert!(login_copy(HarnessId::Symphony, option.provider).contains(option.label));
+        }
+        assert!(
+            login_copy(HarnessId::Symphony, Some("anthropic"))
+                .contains("paste the Claude setup token")
+        );
+    }
+
+    #[test]
     fn a_switch_only_moves_the_live_login_within_its_provider_group() {
         let row = |id: &str, harness, provider: Option<&str>, active| AgentAccount {
             id: id.into(),
@@ -2394,6 +2502,15 @@ mod tests {
                 row("gpt-b", HarnessId::Opencode, Some("openai"), false),
                 row("copilot", HarnessId::Opencode, Some("github-copilot"), true),
                 row("grok-a", HarnessId::Grok, None, true),
+                row("symphony-gpt-a", HarnessId::Symphony, Some("openai"), true),
+                row("symphony-gpt-b", HarnessId::Symphony, Some("openai"), false),
+                row(
+                    "symphony-claude",
+                    HarnessId::Symphony,
+                    Some("anthropic"),
+                    true,
+                ),
+                row("symphony-grok", HarnessId::Symphony, Some("grok"), true),
             ],
             warnings: vec![],
         };
@@ -2405,7 +2522,36 @@ mod tests {
             .filter(|a| a.active)
             .map(|a| a.id.as_str())
             .collect();
-        assert_eq!(live, ["gpt-b", "copilot", "grok-a"]);
+        assert_eq!(
+            live,
+            [
+                "gpt-b",
+                "copilot",
+                "grok-a",
+                "symphony-gpt-a",
+                "symphony-claude",
+                "symphony-grok"
+            ]
+        );
+        let target = snapshot.accounts[5].clone();
+        mark_switched(&mut snapshot, &target);
+        let live: Vec<&str> = snapshot
+            .accounts
+            .iter()
+            .filter(|a| a.active)
+            .map(|a| a.id.as_str())
+            .collect();
+        assert_eq!(
+            live,
+            [
+                "gpt-b",
+                "copilot",
+                "grok-a",
+                "symphony-gpt-b",
+                "symphony-claude",
+                "symphony-grok"
+            ]
+        );
     }
 
     fn page(cx: &mut gpui::TestAppContext) -> gpui::WindowHandle<AccountsPage> {
