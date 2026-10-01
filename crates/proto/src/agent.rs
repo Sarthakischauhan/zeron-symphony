@@ -435,6 +435,19 @@ pub struct SlashCommand {
     /// Placeholder hint for the command's argument, when it takes one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_hint: Option<String>,
+    /// Choices supplied by the provider for argument completion.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<SlashCommandOption>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SlashCommandOption {
+    pub value: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub description: String,
 }
 
 /// A file modification carried inline on a tool result (ACP

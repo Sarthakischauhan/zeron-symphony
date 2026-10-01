@@ -43,9 +43,7 @@ impl SymphonyHarness {
     }
 
     /// Return the checkout that owns the Symphony executable, when it has a
-    /// project-local `.symphony/config.json`. Symphony resolves its config
-    /// from `Path.home()`, so the child needs the checkout as its home rather
-    /// than Zeron's workspace (which is usually a different repository).
+    /// project-local `.symphony/config.json`.
     fn root(executable: &std::path::Path) -> Option<std::path::PathBuf> {
         if let Some(root) = std::env::var_os("SYMPHONY_ROOT") {
             let root = std::path::PathBuf::from(root);
@@ -59,9 +57,21 @@ impl SymphonyHarness {
         })
     }
 
+    /// Credential/config directory used by the spawned agent. Account management
+    /// must resolve the same home, including checkout-local configuration.
+    pub fn credential_home() -> std::path::PathBuf {
+        Self::executable()
+            .as_deref()
+            .and_then(Self::root)
+            .unwrap_or_else(crate::executable::home_or_current_dir)
+            .join(".symphony")
+    }
+
     fn configure(command: &mut Command, executable: &std::path::Path) {
         if let Some(root) = Self::root(executable) {
-            command.env("HOME", &root).env("USERPROFILE", &root);
+            // Point only Symphony's config lookup at the checkout. Replacing
+            // HOME makes Cargo, rustup, and other tools write caches there.
+            command.env("SYMPHONY_HOME", root.join(".symphony"));
         }
     }
 }
@@ -158,7 +168,8 @@ impl SubagentMapper {
     fn map(&mut self, event: &str, payload: &Value) -> Vec<AgentEvent> {
         let tool_id = field(payload, "tool_call_id");
         if event == "tool_execution_started" && field(payload, "tool_name") == "patch" {
-            self.patches.insert(tool_id.into(), payload["arguments"].clone());
+            self.patches
+                .insert(tool_id.into(), payload["arguments"].clone());
         }
         if event == "agent_spawned" {
             let child_id = field(payload, "child_id");
@@ -578,6 +589,9 @@ impl Harness for SymphonyHarness {
     fn installed(&self) -> bool {
         Self::executable().is_some()
     }
+    fn executable_path(&self) -> Option<std::path::PathBuf> {
+        Self::executable()
+    }
     fn deterministic_turn_end(&self) -> bool {
         true
     }
@@ -649,7 +663,7 @@ impl Harness for SymphonyHarness {
                 .map_err(|err| HarnessError::Protocol(format!("Symphony commands: {err}")))?;
             // These actions already belong to Zeron's shell. Keep their
             // unqualified names for the native picker, new-chat and diff UI.
-            commands.retain(|item| !matches!(item.name.as_str(), "model" | "new" | "diff"));
+            prepare_commands(&mut commands);
             Ok(commands)
         };
         let result = tokio::time::timeout(std::time::Duration::from_secs(15), probe)
@@ -759,6 +773,43 @@ impl SymphonyHarness {
     }
 }
 
+fn prepare_commands(commands: &mut Vec<SlashCommand>) {
+    // Native workspace commands own these actions.
+    commands.retain(|item| !matches!(item.name.as_str(), "model" | "new" | "diff"));
+    for command in commands {
+        // Older versions advertise TUI dialogs that stdio cannot open.
+        match command.name.as_str() {
+            "provider" => {
+                command.description =
+                    "Show provider setup instructions; manage accounts in Zeron settings".into()
+            }
+            "langfuse" => command.description = "Show Langfuse telemetry setup instructions".into(),
+            "clear" => command.description = "Show how to clear the transcript in Zeron".into(),
+            "quit" => command.description = "Show how to exit Zeron".into(),
+            "dashboard" => command.description = "List active Symphony agents".into(),
+            _ => {}
+        }
+        command.options.retain(|option| {
+            !option.value.is_empty() && !option.value.chars().any(char::is_control)
+        });
+    }
+}
+
+fn run_frame(request: &RunRequest) -> Value {
+    let mut frame =
+        json!({"type":"run", "prompt": request.prompt, "attachments": request.attachments});
+    if let Some(effort) = request
+        .model_options
+        .get("symphonyReasoningEffort")
+        .and_then(Value::as_str)
+    {
+        frame["reasoning_effort"] = json!(effort);
+    } else if let Some(reasoning) = request.reasoning {
+        frame["reasoning_effort"] = json!(reasoning);
+    }
+    frame
+}
+
 async fn drive_session(
     sessions: Arc<SessionTable>,
     exe: std::path::PathBuf,
@@ -819,9 +870,7 @@ async fn drive_session(
         session_id: session_id.clone(),
         assistant_message_id: uuid::Uuid::new_v4().to_string(),
     }));
-    let line = json!({"type":"run", "prompt": request.prompt, "attachments": request.attachments})
-        .to_string()
-        + "\n";
+    let line = run_frame(&request).to_string() + "\n";
     if bridge.stdin.write_all(line.as_bytes()).await.is_err() {
         started = false;
         kill = true;
@@ -1023,6 +1072,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn command_choices_are_preserved_and_native_actions_are_not_advertised() {
+        let mut commands: Vec<SlashCommand> = serde_json::from_value(json!([
+            {"name":"personality", "options":[{"value":"precise", "label":"Precise"}, {"value":"bad\nvalue"}]},
+            {"name":"model"}, {"name":"new"}, {"name":"diff"}, {"name":"provider"}
+        ])).unwrap();
+        prepare_commands(&mut commands);
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0].options.len(), 1);
+        assert_eq!(commands[0].options[0].value, "precise");
+        assert!(commands[1].description.contains("settings"));
+        let legacy: SlashCommand = serde_json::from_value(json!({"name":"status"})).unwrap();
+        assert!(legacy.options.is_empty());
+    }
+
+    #[test]
     fn write_file_and_patch_use_symphony_schema_names() {
         assert_eq!(
             map_event(
@@ -1111,26 +1175,40 @@ mod tests {
             "tool_call_id":"edit-1", "tool_name":"patch",
             "arguments":{"path":"src/main.py", "old_str":"print('old')\n", "new_str":"print('new')\n"}
         }));
-        let result = mapper.map("tool_execution_completed", &json!({
-            "tool_call_id":"edit-1", "tool_name":"patch", "status":"success",
-            "result":"patched src/main.py (1 replacement(s), +0 bytes)"
-        }));
-        assert!(matches!(&result[..], [AgentEvent::ToolResult { output: Some(output), diff: Some(diff), .. }]
+        let result = mapper.map(
+            "tool_execution_completed",
+            &json!({
+                "tool_call_id":"edit-1", "tool_name":"patch", "status":"success",
+                "result":"patched src/main.py (1 replacement(s), +0 bytes)"
+            }),
+        );
+        assert!(
+            matches!(&result[..], [AgentEvent::ToolResult { output: Some(output), diff: Some(diff), .. }]
             if output.starts_with("patched src/main.py")
                 && diff.path == "src/main.py"
                 && diff.old_text.as_deref() == Some("print('old')\n")
-                && diff.new_text == "print('new')\n"));
+                && diff.new_text == "print('new')\n")
+        );
         assert!(mapper.patches.is_empty());
 
-        mapper.map("tool_execution_started", &json!({
-            "tool_call_id":"edit-2", "tool_name":"patch",
-            "arguments":{"path":"src/main.py", "old_str":"missing", "new_str":"new"}
-        }));
-        let failed = mapper.map("tool_execution_completed", &json!({
-            "tool_call_id":"edit-2", "tool_name":"patch", "status":"success",
-            "result":"old_str not found in src/main.py"
-        }));
-        assert!(matches!(&failed[..], [AgentEvent::ToolResult { diff: None, .. }]));
+        mapper.map(
+            "tool_execution_started",
+            &json!({
+                "tool_call_id":"edit-2", "tool_name":"patch",
+                "arguments":{"path":"src/main.py", "old_str":"missing", "new_str":"new"}
+            }),
+        );
+        let failed = mapper.map(
+            "tool_execution_completed",
+            &json!({
+                "tool_call_id":"edit-2", "tool_name":"patch", "status":"success",
+                "result":"old_str not found in src/main.py"
+            }),
+        );
+        assert!(matches!(
+            &failed[..],
+            [AgentEvent::ToolResult { diff: None, .. }]
+        ));
     }
 
     #[test]

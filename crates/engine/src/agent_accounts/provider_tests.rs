@@ -138,6 +138,9 @@ fn mocked(base: &str) -> ProbeEndpoints {
         openai_auth: base.to_string(),
         openai_port: 0,
         nous_portal: base.to_string(),
+        symphony_anthropic_token: format!("{base}/symphony/anthropic/token"),
+        symphony_xai_device: format!("{base}/symphony/xai/device"),
+        symphony_xai_token: format!("{base}/symphony/xai/token"),
         allow_slot_refresh: true,
         allow_loopback_http: true,
     }
@@ -1904,5 +1907,79 @@ async fn a_failed_sign_ins_output_is_redacted_before_the_ui_sees_it() {
     assert_eq!(
         message,
         "failed at https://auth.x.ai/device?… with code [code] token=[redacted]"
+    );
+}
+
+#[tokio::test]
+async fn symphony_chatgpt_browser_callback_saves_native_tokens_without_replacing_current_login() {
+    let server = MockServer::start(|method, path, body| match (method, path) {
+        ("POST", "/oauth/token") => {
+            assert!(body.contains("grant_type=authorization_code"), "{body}");
+            assert!(body.contains("code=good-code"), "{body}");
+            assert!(body.contains("code_verifier="), "{body}");
+            let who = if body.contains("second") { "b" } else { "a" };
+            (
+                200,
+                serde_json::json!({
+                    "access_token": chatgpt_access(&format!("{who}@example.com"), &format!("acct-{who}"), "pro"),
+                    "refresh_token": format!("refresh-{who}"),
+                    "id_token": jwt(serde_json::json!({ "email": format!("{who}@example.com") })),
+                    "expires_in": 3600,
+                })
+                .to_string(),
+            )
+        }
+        _ => (404, String::new()),
+    })
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (accounts, config) = accounts_with(tmp.path(), mocked(&server.base));
+    let sign_in = |code: &'static str| {
+        let accounts = accounts.clone();
+        async move {
+            let start = accounts.start_login(HarnessId::Symphony).await.unwrap();
+            assert_eq!(start.mode, AgentLoginMode::Browser);
+            let port = start.callback_port.expect("loopback port reported");
+            assert_eq!(loopback_port(&start.url), Some(port));
+            assert_eq!(query_param(&start.url, "originator"), "symphony");
+            let state = query_param(&start.url, "state");
+            // A stray without our state neither finishes nor kills it.
+            assert!(
+                browser_get(port, "/auth/callback?code=x&state=nope")
+                    .await
+                    .starts_with("HTTP/1.1 400")
+            );
+            let reply =
+                browser_get(port, &format!("/auth/callback?code={code}&state={state}")).await;
+            assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+            let polls = settle(&accounts, &start.login_id).await;
+            assert_eq!(
+                polls.last().unwrap().status,
+                AgentLoginStatus::Done,
+                "{polls:?}"
+            );
+        }
+    };
+    sign_in("good-code").await;
+    let file = config.symphony_home.join("oauth/openai.json");
+    let live: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    assert_eq!(live["account_id"], "acct-a", "first login connected");
+    assert_eq!(live["token_type"], "Bearer");
+    assert!(live["expires_at"].as_i64().unwrap() < now_ms());
+    // A second account is saved next to it — the live one stays.
+    sign_in("good-code-second").await;
+    let live: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    assert_eq!(live["account_id"], "acct-a");
+    let pi = rows(&accounts.list(false).await.unwrap(), HarnessId::Symphony);
+    assert_eq!(pi.len(), 2);
+    assert!(
+        pi.iter()
+            .any(|a| a.email.as_deref() == Some("b@example.com") && !a.active)
+    );
+    assert!(
+        pi.iter()
+            .all(|a| a.plan_label.as_deref() == Some("ChatGPT"))
     );
 }

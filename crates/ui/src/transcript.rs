@@ -3052,6 +3052,8 @@ pub struct Transcript {
     list: ListState,
     rows: Vec<Row>,
     last_source: Option<(Option<String>, TranscriptReplayState, u64)>,
+    /// Window-local presentation only; clearing never edits the shared doc.
+    cleared_entries: HashSet<String>,
     chat_id: Option<String>,
     /// The shell may retain this already-laid-out view briefly for its exit.
     /// Cleared as soon as the exit is invisible; never used for another chat.
@@ -3380,6 +3382,7 @@ impl Transcript {
             list,
             rows: Vec::new(),
             last_source: None,
+            cleared_entries: HashSet::new(),
             // Pre-set so `sync` never sees an attach edge — an override
             // instance must not reset (or re-pin) on selection changes.
             chat_id: doc_override.clone(),
@@ -3595,6 +3598,33 @@ impl Transcript {
             self.saved_viewports
                 .insert(chat_id, SavedViewport::FollowTail);
         }
+    }
+
+    /// Hide existing entries until leaving this conversation. Future entries
+    /// still render, while persistence, remote viewers and model context stay intact.
+    pub(crate) fn clear_view(&mut self, cx: &mut Context<Self>) {
+        if self.doc_override.is_some() {
+            return;
+        }
+        self.cleared_entries.extend(
+            self.state
+                .read(cx)
+                .transcript
+                .iter()
+                .map(|entry| entry.id.clone()),
+        );
+        self.cleared_entries.extend(
+            self.state
+                .read(cx)
+                .pending_echoes()
+                .iter()
+                .map(|entry| entry.id.clone()),
+        );
+        self.stop_automatic_scrolling();
+        self.own_turn = None;
+        self.last_source = None;
+        self.sync(cx);
+        cx.notify();
     }
 
     pub(crate) fn state_entity(&self) -> &Entity<AppState> {
@@ -4515,6 +4545,7 @@ impl Transcript {
                 self.own_turn_last_tick = None;
             }
             self.chat_id = selected;
+            self.cleared_entries.clear();
             self.rows.clear();
             self.row_cache.clear();
             self.live_parsers.clear();
@@ -4593,6 +4624,9 @@ impl Transcript {
                 .as_ref()
                 .and_then(|id| state.prepared_transcripts.get(id));
             for entry in entries {
+                if self.cleared_entries.contains(&entry.id) {
+                    continue;
+                }
                 if !self.compact_mode
                     && let Some(rows) = prepared.and_then(|p| p.rows.get(&entry.id))
                 {
@@ -4603,6 +4637,9 @@ impl Transcript {
             }
             if self.doc_override.is_none() {
                 for echo in state.pending_echoes() {
+                    if self.cleared_entries.contains(&echo.id) {
+                        continue;
+                    }
                     new_rows.extend(self.rows_for(echo, true));
                 }
             }
@@ -8979,6 +9016,37 @@ mod tests {
         assert!(!jump_visibility(shown, AT_BOTTOM_PX));
         assert!(!jump_visibility(false, 319.0));
         assert!(jump_visibility(false, 321.0));
+    }
+
+    #[gpui::test]
+    fn clear_view_hides_existing_entries_without_deleting_shared_history(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        with_tool_group_navigation(cx, |state, transcript, cx| {
+            assert!(!transcript.read(cx).rows.is_empty());
+            transcript.update(cx, |this, cx| this.clear_view(cx));
+            assert!(transcript.read(cx).rows.is_empty());
+            assert_eq!(state.read(cx).transcript.len(), 1);
+            state.update(cx, |state, _| {
+                state.transcript.push(assistant(
+                    "new",
+                    MessageStatus::Complete,
+                    vec![tool_part("new-call", "pwd")],
+                ));
+                state.transcript_revision += 1;
+            });
+            transcript.update(cx, |this, cx| this.sync(cx));
+            assert!(!transcript.read(cx).rows.is_empty());
+            assert!(
+                transcript
+                    .read(cx)
+                    .rows
+                    .iter()
+                    .all(|row| row.entry_id.as_ref() == "new")
+            );
+            replay_tool_group(&state, &transcript, "chat-b", cx);
+            assert!(!transcript.read(cx).rows.is_empty());
+        });
     }
 
     #[gpui::test]

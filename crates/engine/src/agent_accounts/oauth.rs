@@ -39,7 +39,10 @@ impl AgentAccounts {
         harness: HarnessId,
         store_key: &'static str,
     ) -> Result<AgentLoginStart, EngineError> {
-        debug_assert_eq!(upstream_of(harness, store_key), Some(Upstream::OpenAi));
+        debug_assert!(
+            harness == HarnessId::Symphony
+                || upstream_of(harness, store_key) == Some(Upstream::OpenAi)
+        );
         self.reap_spawned_flows(harness);
         let wanted = self.inner.endpoints.openai_port;
         self.reap_port_flows(OPENAI_LOOPBACK_PORT);
@@ -63,6 +66,7 @@ impl AgentAccounts {
         let redirect = format!("http://localhost:{port}/auth/callback");
         let originator = match harness {
             HarnessId::Pi => "pi",
+            HarnessId::Symphony => "symphony",
             _ => "opencode",
         };
         let url = format!(
@@ -224,6 +228,21 @@ impl AgentAccounts {
             });
         if let (Some(account_id), Some(map)) = (account_id, entry.as_object_mut()) {
             map.insert("accountId".into(), serde_json::json!(account_id));
+        }
+        if harness == HarnessId::Symphony {
+            let token = serde_json::json!({
+                "access_token": access,
+                "refresh_token": refresh,
+                "id_token": id_token,
+                "token_type": "Bearer",
+                "expires_at": (now_ms() / 1000) + expires_in,
+                "account_id": entry.get("accountId").and_then(|v| v.as_str()).unwrap_or(""),
+                "scope": tokens.get("scope").and_then(|v| v.as_str()).unwrap_or(""),
+            });
+            let detected = stores::symphony_detected(store_key, &token).ok_or_else(|| {
+                EngineError::Other("Could not identify the signed-in ChatGPT account.".into())
+            })?;
+            return self.save_new_login(harness, &detected).await;
         }
         let detected =
             openai_detected(store_key, &entry, id_token.as_deref()).ok_or_else(|| {

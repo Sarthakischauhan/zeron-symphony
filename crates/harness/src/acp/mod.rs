@@ -706,6 +706,7 @@ fn skill_commands(dirs: &[PathBuf]) -> Vec<SlashCommand> {
                 continue;
             }
             commands.push(SlashCommand {
+                options: vec![],
                 name,
                 description: first_sentence(&description),
                 input_hint: None,

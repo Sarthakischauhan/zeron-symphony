@@ -67,6 +67,13 @@ fn slow_catalog_delay() -> Option<std::time::Duration> {
 // Catalog invalidation (Settings → Providers toggles)
 // ---------------------------------------------------------------------------
 
+/// True while any picker menu is interactive. The composer input reads this
+/// so an unbound Enter is not inserted into the draft as a newline.
+#[derive(Default)]
+pub struct PickerOpen(pub bool);
+
+impl gpui::Global for PickerOpen {}
+
 /// Marker global: [`bump_harness_catalog`] pokes it whenever a Settings →
 /// Agents toggle changes some device's enabled set, and every [`Pickers`]
 /// observes it to force-refresh its cached harness catalog — without this the
@@ -524,6 +531,7 @@ pub struct Pickers {
     /// Selection the draft picks belong to — switching chats drops them so a
     /// pick made in one chat never leaks into another.
     draft_owner: Option<String>,
+    symphony_effort: Option<String>,
     /// Space the branch draft/cache belong to (see the state observer).
     space_owner: Option<String>,
     device_owner: Option<String>,
@@ -636,6 +644,7 @@ impl Pickers {
     ) -> Self {
         let search = cx.new(|cx| {
             ComposerInput::with_context("Search…", "PaletteSearch", cx)
+                .with_single_line()
                 .with_accessibility_role(gpui::Role::SearchInput)
         });
         let search_events = cx.subscribe(&search, |this: &mut Self, _, event, cx| match event {
@@ -686,6 +695,7 @@ impl Pickers {
                 this.config.harness = None;
                 this.config.model = None;
                 this.config.reasoning = None;
+                this.symphony_effort = None;
                 this.switch_error = None;
             }
             // A space switch invalidates the branch draft + cache — the folder
@@ -765,6 +775,7 @@ impl Pickers {
             defaults,
             data_dir,
             draft_owner,
+            symphony_effort: None,
             open,
             model_rail: ModelRail::default(),
             setting_menu: None,
@@ -1051,7 +1062,15 @@ impl Pickers {
                 // Catalog not loaded (offline): still send the id we know.
                 .or_else(|| self.effective_model_id(cx).map(str::to_string)),
             reasoning: self.effective_reasoning(cx),
-            model_options: self.explicit_options(cx),
+            model_options: {
+                let mut options = self.explicit_options(cx);
+                if self.effective_harness(cx) == Some(HarnessId::Symphony) {
+                    if let Some(effort) = &self.symphony_effort {
+                        options.insert("symphonyReasoningEffort".into(), serde_json::json!(effort));
+                    }
+                }
+                options
+            },
         }
     }
 
@@ -1074,6 +1093,13 @@ impl Pickers {
         self.open.get().copied()
     }
 
+    fn publish_open(&self, cx: &mut Context<Self>) {
+        let open = self.is_open();
+        if cx.default_global::<PickerOpen>().0 != open {
+            cx.set_global(PickerOpen(open));
+        }
+    }
+
     /// Begin the exit animation (shared by every close path).
     fn animate_close(&mut self, cx: &mut Context<Self>) {
         if self.is_open() {
@@ -1093,6 +1119,7 @@ impl Pickers {
         if self.open.begin_close() {
             popover::reap_popup(cx, |pickers: &mut Self| &mut pickers.open);
         }
+        self.publish_open(cx);
         cx.notify();
     }
 
@@ -1144,6 +1171,7 @@ impl Pickers {
             self.open_model_height = model_menu_height(self.setting_groups(cx).len());
         }
         self.open.open(kind);
+        self.publish_open(cx);
         self.focus_on_mount = true;
         // The plain-div menus (branch / project / device) share one scroll
         // handle; a fresh open starts at the top. The model list resets its
@@ -1718,6 +1746,8 @@ impl Pickers {
             // Existing chat: persist to the chat row (Mutate setChatConfig) —
             // survives restarts and syncs; next runs in this chat use it.
             self.update_chat_config(cx, move |config| config.model = Some(model_id));
+            self.close(cx);
+            return;
         } else {
             // New chat: draft pick + sticky last-used memory for this harness.
             self.config.model = Some(model_id.clone());
@@ -1732,14 +1762,35 @@ impl Pickers {
                 self.defaults.remember_model(harness, model_id, label);
                 self.save_defaults();
             }
+            self.close(cx);
+        }
+    }
+
+    pub(crate) fn select_symphony_effort_command(&mut self, effort: &str, cx: &mut Context<Self>) {
+        let reasoning = serde_json::from_value::<ReasoningLevel>(serde_json::json!(effort)).ok();
+        let effort = effort.to_string();
+        if self.state.read(cx).selected_chat.is_some() {
+            self.update_chat_config(cx, move |config| {
+                config.reasoning = reasoning;
+                config
+                    .model_options
+                    .insert("symphonyReasoningEffort".into(), serde_json::json!(effort));
+            });
+        } else {
+            self.config.reasoning = reasoning;
+            self.symphony_effort = Some(effort);
         }
         cx.notify();
     }
 
     fn pick_reasoning(&mut self, level: ReasoningLevel, cx: &mut Context<Self>) {
+        self.symphony_effort = None;
         // Always a concrete selection (no toggle-back-to-default).
         if self.state.read(cx).selected_chat.is_some() {
-            self.update_chat_config(cx, move |config| config.reasoning = Some(level));
+            self.update_chat_config(cx, move |config| {
+                config.model_options.remove("symphonyReasoningEffort");
+                config.reasoning = Some(level);
+            });
         } else {
             self.config.reasoning = Some(level);
             self.defaults.reasoning = Some(level);
@@ -1835,8 +1886,18 @@ impl Pickers {
                 .as_deref()
                 .and_then(|id| models.iter().find(|m| m.id == id))
             {
+                let effort = if config.harness == HarnessId::Symphony {
+                    config.model_options.get("symphonyReasoningEffort").cloned()
+                } else {
+                    None
+                };
                 config.model_options =
                     offered_options(model, std::mem::take(&mut config.model_options));
+                if let Some(effort) = effort {
+                    config
+                        .model_options
+                        .insert("symphonyReasoningEffort".into(), effort);
+                }
             }
         }
         self.state.update(cx, |state, cx| {
@@ -5369,6 +5430,7 @@ impl Render for Pickers {
             // recovery has handled the old dispatch tree.
             window.focus(&self.focus, cx);
         }
+        self.publish_open(cx);
         if self.is_open() {
             let search = self.search.focus_handle(cx);
             let frame = self.focus.clone();
@@ -5540,14 +5602,39 @@ mod tests {
     use super::*;
     use zeron_proto::{FolderEntry, Model, ModelOption, ModelOptionChoice};
 
+    #[gpui::test]
+    fn symphony_effort_override_survives_resolved_run_settings(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
+            let state = cx.new(|_| AppState::new());
+            let pickers = cx.new(|cx| Pickers::new(state, cx));
+            pickers.update(cx, |pickers, cx| {
+                pickers.config.harness = Some(HarnessId::Symphony);
+                pickers.select_symphony_effort_command("none", cx);
+                assert_eq!(pickers.resolved(cx).model_options["symphonyReasoningEffort"], "none");
+                pickers.select_symphony_effort_command("low", cx);
+                assert_eq!(pickers.resolved(cx).model_options["symphonyReasoningEffort"], "low");
+                pickers.pick_reasoning(ReasoningLevel::High, cx);
+                assert!(!pickers.resolved(cx).model_options.contains_key("symphonyReasoningEffort"));
+            });
+        });
+    }
+
     #[test]
     fn symphony_models_use_provider_marks() {
         let icon = |id| model_brand_icon(HarnessId::Symphony, id).0;
         assert_eq!(icon("openai:gpt-5.6"), crate::icons::OPENAI_MARK);
-        assert_eq!(icon("anthropic:claude-sonnet-4-6"), crate::icons::CLAUDE_MARK);
+        assert_eq!(
+            icon("anthropic:claude-sonnet-4-6"),
+            crate::icons::CLAUDE_MARK
+        );
         assert_eq!(icon("gemini:gemini-3.1-pro"), crate::icons::GEMINI_MARK);
         assert_eq!(icon("grok:grok-4"), crate::icons::GROK_MARK);
-        assert_eq!(icon("openrouter:anthropic/claude-sonnet-4-6"), crate::icons::SYMPHONY_MARK);
+        assert_eq!(
+            icon("openrouter:anthropic/claude-sonnet-4-6"),
+            crate::icons::SYMPHONY_MARK
+        );
         assert_eq!(icon("default"), crate::icons::SYMPHONY_MARK);
     }
 
@@ -5949,6 +6036,17 @@ mod tests {
         cx.simulate_keystrokes(handle.into(), "up");
         handle
             .read_with(cx, |host, cx| assert_eq!(host.pickers.read(cx).active, 0))
+            .unwrap();
+        cx.simulate_keystrokes(handle.into(), "down enter");
+        handle
+            .read_with(cx, |host, cx| {
+                let pickers = host.pickers.read(cx);
+                assert_eq!(pickers.resolved(cx).model.as_deref(), Some("second"));
+                assert!(
+                    pickers.search.read(cx).text().is_empty(),
+                    "Enter must select the row, not insert into the filter"
+                );
+            })
             .unwrap();
         cx.simulate_keystrokes(handle.into(), "escape");
         handle
