@@ -1,18 +1,19 @@
-//! Native Symphony driver. One stdio process handles one persisted turn.
+//! Native Symphony driver. One stdio process handles one Zeron session.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::{StreamExt, stream::BoxStream};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    sync::mpsc,
+    sync::{Mutex, mpsc},
 };
 use zeron_proto::{
     AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SlashCommand,
-    SteeringMode, ToolCall, ToolDiff,
-    UserInputQuestion,
+    SteeringMode, ToolCall, ToolDiff, UserInputQuestion,
 };
 
 use crate::{
@@ -20,13 +21,18 @@ use crate::{
     process::{Command, Stdio},
 };
 
-pub struct SymphonyHarness;
+pub struct SymphonyHarness {
+    sessions: Arc<SessionTable>,
+}
 
 const PROTOCOL_VERSION: u64 = 2;
+const INTERRUPT_GRACE: Duration = Duration::from_secs(5);
 
 impl SymphonyHarness {
     pub fn new() -> Self {
-        Self
+        Self {
+            sessions: Arc::new(SessionTable::default()),
+        }
     }
 
     fn executable() -> Option<std::path::PathBuf> {
@@ -78,20 +84,25 @@ fn tool_call(name: &str, args: &Value) -> ToolCall {
         "read_file" => ToolCall::ReadFile {
             path: field(args, "path").into(),
         },
+        // `content` is WriteFileArgs.content, forwarded on
+        // tool_execution_started.arguments (coding_agent/.../tools/write_file.py).
         "write_file" => ToolCall::WriteFile {
             path: field(args, "path").into(),
-            content: None,
+            content: args
+                .get("content")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
         },
+        // PatchArgs fields are path, old_str, new_str, replace_all
+        // (coding_agent/.../tools/patch.py). EditFile has no replace_all slot.
         "patch" => ToolCall::EditFile {
             path: field(args, "path").into(),
             old_string: args
                 .get("old_str")
-                .or_else(|| args.get("old_string"))
                 .and_then(Value::as_str)
                 .map(str::to_owned),
             new_string: args
                 .get("new_str")
-                .or_else(|| args.get("new_string"))
                 .and_then(Value::as_str)
                 .map(str::to_owned),
         },
@@ -264,6 +275,8 @@ fn map_event(event: &str, payload: &Value) -> Option<AgentEvent> {
             id: field(payload, "tool_call_id").into(),
             is_error: matches!(field(payload, "status"), "error" | "cancelled" | "timeout"),
             output: Some(field(payload, "result").chars().take(8_000).collect()),
+            // tool_completed_payload does not carry a diff. Leave it unset
+            // until Symphony emits one; do not invent a key.
             diff: None,
         }),
         "assistant_message_completed" => Some(AgentEvent::AssistantMessageCompleted {
@@ -304,6 +317,247 @@ fn catalog_models(frame: &Value, request_id: &str) -> Result<Vec<Model>, Harness
         .collect())
 }
 
+type StdioLines = tokio::io::Lines<BufReader<crate::process::ChildStdout>>;
+
+struct Bridge {
+    child: crate::process::Child,
+    stdin: crate::process::ChildStdin,
+    lines: StdioLines,
+    cwd: String,
+    auto_approve: bool,
+    /// `--model` captured at spawn. `None` means Symphony's configured default.
+    launched_model: Option<String>,
+    model_name: String,
+    session_id: String,
+}
+
+struct Shared {
+    stop: crate::CancellationToken,
+    bridge: Mutex<Bridge>,
+}
+
+#[derive(Default)]
+struct SessionTable {
+    by_id: StdMutex<HashMap<String, Arc<Shared>>>,
+    catalog: Mutex<Option<Bridge>>,
+}
+
+impl SessionTable {
+    fn insert(&self, session_id: String, shared: Arc<Shared>) {
+        self.by_id
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .insert(session_id, shared);
+    }
+
+    fn remove_if_same(&self, session_id: &str, shared: &Arc<Shared>) {
+        let mut guard = self.by_id.lock().unwrap_or_else(|err| err.into_inner());
+        if guard
+            .get(session_id)
+            .is_some_and(|current| Arc::ptr_eq(current, shared))
+        {
+            guard.remove(session_id);
+        }
+    }
+
+    fn release(&self, session_id: &str) {
+        if let Some(shared) = self
+            .by_id
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .remove(session_id)
+        {
+            shared.stop.cancel();
+        }
+    }
+
+    fn idle_sessions(&self) -> Vec<Arc<Shared>> {
+        self.by_id
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .values()
+            .cloned()
+            .collect()
+    }
+}
+
+fn child_running(child: &mut crate::process::Child) -> bool {
+    !matches!(child.try_wait(), Ok(Some(_)))
+}
+
+fn launched_model(model: Option<&str>) -> Option<String> {
+    model
+        .filter(|model| *model != "default" && !model.is_empty())
+        .map(str::to_owned)
+}
+
+fn bridge_matches(bridge: &Bridge, request: &RunRequest) -> bool {
+    bridge.cwd == request.cwd
+        && bridge.auto_approve == request.auto_approve
+        && bridge.launched_model == launched_model(request.model.as_deref())
+}
+
+async fn take_matching(table: &SessionTable, request: &RunRequest) -> Option<Arc<Shared>> {
+    let Some(session_id) = request.resume.as_deref().filter(|id| !id.is_empty()) else {
+        return None;
+    };
+    let shared = table
+        .by_id
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .get(session_id)
+        .cloned()?;
+    if shared.stop.is_cancelled() {
+        table.remove_if_same(session_id, &shared);
+        return None;
+    }
+    let mut bridge = shared.bridge.lock().await;
+    let reusable = child_running(&mut bridge.child) && bridge_matches(&bridge, request);
+    drop(bridge);
+    if reusable {
+        return Some(shared);
+    }
+    table.remove_if_same(session_id, &shared);
+    None
+}
+
+fn launch(
+    command: &mut crate::process::Command,
+    cwd: &str,
+    auto_approve: bool,
+    model: Option<String>,
+) -> Result<Bridge, HarnessError> {
+    command
+        .stdin(crate::process::Stdio::piped())
+        .stdout(crate::process::Stdio::piped())
+        .stderr(crate::process::Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn()?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| HarnessError::Protocol("no Symphony stdin".into()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| HarnessError::Protocol("no Symphony stdout".into()))?;
+    if let Some(stderr) = child.stderr.take() {
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                tracing::debug!("Symphony: {line}");
+            }
+        });
+    }
+    Ok(Bridge {
+        child,
+        stdin,
+        lines: BufReader::new(stdout).lines(),
+        cwd: cwd.to_owned(),
+        auto_approve,
+        launched_model: model,
+        model_name: String::new(),
+        session_id: String::new(),
+    })
+}
+
+fn run_command(exe: &std::path::Path, request: &RunRequest) -> crate::process::Command {
+    let mut command = crate::process::Command::new(exe);
+    command.arg("stdio").arg("--workspace").arg(&request.cwd);
+    if let Some(resume) = request.resume.as_deref().filter(|id| !id.is_empty()) {
+        command.arg("--session-id").arg(resume);
+    }
+    if let Some(model) = launched_model(request.model.as_deref()) {
+        command.arg("--model").arg(model);
+    }
+    if request.auto_approve {
+        command.arg("--unattended");
+    }
+    SymphonyHarness::configure(&mut command, exe);
+    command.current_dir(&request.cwd);
+    crate::compose_child_path(&mut command, exe);
+    command
+}
+
+async fn read_frame(lines: &mut StdioLines) -> Result<Option<Value>, HarnessError> {
+    let Some(line) = lines.next_line().await? else {
+        return Ok(None);
+    };
+    match serde_json::from_str::<Value>(&line) {
+        Ok(frame) => Ok(Some(frame)),
+        Err(_) => Ok(Some(Value::Null)),
+    }
+}
+
+async fn list_models(bridge: &mut Bridge) -> Result<Vec<Model>, HarnessError> {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let request = json!({"type":"model/list", "request_id": request_id}).to_string() + "\n";
+    bridge.stdin.write_all(request.as_bytes()).await?;
+    let probe = async {
+        loop {
+            let Some(frame) = read_frame(&mut bridge.lines).await? else {
+                return Err(HarnessError::Protocol(
+                    "Symphony exited before listing models".into(),
+                ));
+            };
+            if frame.is_null() {
+                continue;
+            }
+            if field(&frame, "type") == "error" {
+                return Err(HarnessError::Protocol(field(&frame, "message").into()));
+            }
+            if field(&frame, "type") == "models" {
+                return catalog_models(&frame, &request_id);
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(15), probe)
+        .await
+        .map_err(|_| HarnessError::Protocol("Symphony model discovery timed out".into()))?
+}
+
+async fn accept_ready(
+    bridge: &mut Bridge,
+    requested: Option<&str>,
+    enforce_model: bool,
+) -> Result<(), HarnessError> {
+    loop {
+        let Some(frame) = read_frame(&mut bridge.lines).await? else {
+            return Err(HarnessError::Protocol(
+                "Symphony exited before the handshake".into(),
+            ));
+        };
+        if frame.is_null() {
+            continue;
+        }
+        if field(&frame, "type") == "error" {
+            return Err(HarnessError::Protocol(field(&frame, "message").into()));
+        }
+        check_version(&frame)?;
+        if field(&frame, "type") != "ready" {
+            return Err(HarnessError::Protocol("Symphony did not send ready".into()));
+        }
+        bridge.model_name = field(&frame, "model").to_owned();
+        bridge.session_id = field(&frame, "session_id").to_owned();
+        if enforce_model {
+            check_ready_model(requested, field(&frame, "model"))?;
+            if bridge.session_id.is_empty() {
+                return Err(HarnessError::Protocol(
+                    "Symphony ready frame has no session id".into(),
+                ));
+            }
+        }
+        return Ok(());
+    }
+}
+
+async fn reap(bridge: &mut Bridge) {
+    if child_running(&mut bridge.child) {
+        let _ = bridge.child.start_kill();
+    }
+    let _ = bridge.child.wait().await;
+}
+
 #[async_trait]
 impl Harness for SymphonyHarness {
     fn id(&self) -> HarnessId {
@@ -336,6 +590,10 @@ impl Harness for SymphonyHarness {
             options: vec![],
         }]
     }
+    fn release_session(&self, session_id: &str) {
+        self.sessions.release(session_id);
+    }
+
     async fn commands_for(&self, cwd: &std::path::Path) -> Result<Vec<SlashCommand>, HarnessError> {
         let exe =
             Self::executable().ok_or_else(|| HarnessError::NotInstalled("symphony".into()))?;
@@ -373,7 +631,8 @@ impl Harness for SymphonyHarness {
                 return Err(HarnessError::Protocol("Symphony did not send ready".into()));
             }
             let request_id = uuid::Uuid::new_v4().to_string();
-            let request = json!({"type":"command/list", "request_id":request_id}).to_string() + "\n";
+            let request =
+                json!({"type":"command/list", "request_id":request_id}).to_string() + "\n";
             stdin.write_all(request.as_bytes()).await?;
             let frame = lines.next_line().await?.ok_or_else(|| {
                 HarnessError::Protocol("Symphony exited before listing commands".into())
@@ -381,8 +640,11 @@ impl Harness for SymphonyHarness {
             let frame: Value = serde_json::from_str(&frame)
                 .map_err(|err| HarnessError::Protocol(format!("Symphony command frame: {err}")))?;
             if field(&frame, "type") != "commands" || field(&frame, "request_id") != request_id {
-                return Err(HarnessError::Protocol("Symphony command response did not match".into()));
+                return Err(HarnessError::Protocol(
+                    "Symphony command response did not match".into(),
+                ));
             }
+            check_version(&frame)?;
             let mut commands: Vec<SlashCommand> = serde_json::from_value(frame["commands"].clone())
                 .map_err(|err| HarnessError::Protocol(format!("Symphony commands: {err}")))?;
             // These actions already belong to Zeron's shell. Keep their
@@ -397,60 +659,37 @@ impl Harness for SymphonyHarness {
         let _ = child.wait().await;
         result
     }
+
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-        let exe =
-            Self::executable().ok_or_else(|| HarnessError::NotInstalled("symphony".into()))?;
-        let mut command = Command::new(&exe);
-        command.arg("stdio");
-        Self::configure(&mut command, &exe);
-        crate::compose_child_path(&mut command, &exe);
-        command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-        let mut child = command.spawn()?;
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| HarnessError::Protocol("Symphony model probe has no stdin".into()))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| HarnessError::Protocol("Symphony model probe has no stdout".into()))?;
-        let probe = async {
-            let mut lines = BufReader::new(stdout).lines();
-            let ready = lines.next_line().await?.ok_or_else(|| {
-                HarnessError::Protocol("Symphony exited before the model handshake".into())
-            })?;
-            let ready: Value = serde_json::from_str(&ready)
-                .map_err(|err| HarnessError::Protocol(format!("Symphony ready frame: {err}")))?;
-            if field(&ready, "type") == "error" {
-                return Err(HarnessError::Protocol(field(&ready, "message").into()));
+        for shared in self.sessions.idle_sessions() {
+            if shared.stop.is_cancelled() {
+                continue;
             }
-            check_version(&ready)?;
-            if field(&ready, "type") != "ready" {
-                return Err(HarnessError::Protocol("Symphony did not send ready".into()));
+            let Ok(mut bridge) = shared.bridge.try_lock() else {
+                continue;
+            };
+            if !child_running(&mut bridge.child) {
+                drop(bridge);
+                self.sessions
+                    .remove_if_same(&shared_session_id(&shared).await, &shared);
+                continue;
             }
-            let request_id = uuid::Uuid::new_v4().to_string();
-            let request = json!({"type":"model/list", "request_id":request_id}).to_string() + "\n";
-            stdin.write_all(request.as_bytes()).await?;
-            let response = lines.next_line().await?.ok_or_else(|| {
-                HarnessError::Protocol("Symphony exited before listing models".into())
-            })?;
-            let response: Value = serde_json::from_str(&response)
-                .map_err(|err| HarnessError::Protocol(format!("Symphony model frame: {err}")))?;
-            if field(&response, "type") == "error" {
-                return Err(HarnessError::Protocol(field(&response, "message").into()));
+            match list_models(&mut bridge).await {
+                Ok(models) => return Ok(models),
+                Err(err) => {
+                    if !child_running(&mut bridge.child) {
+                        let session_id = bridge.session_id.clone();
+                        reap(&mut bridge).await;
+                        drop(bridge);
+                        if !session_id.is_empty() {
+                            self.sessions.remove_if_same(&session_id, &shared);
+                        }
+                    }
+                    return Err(err);
+                }
             }
-            catalog_models(&response, &request_id)
-        };
-        let result = tokio::time::timeout(std::time::Duration::from_secs(15), probe)
-            .await
-            .map_err(|_| HarnessError::Protocol("Symphony model discovery timed out".into()))?;
-        let _ = child.start_kill();
-        let _ = child.wait().await;
-        result
+        }
+        self.catalog_models().await
     }
 
     async fn run(
@@ -460,96 +699,174 @@ impl Harness for SymphonyHarness {
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let exe =
             Self::executable().ok_or_else(|| HarnessError::NotInstalled("symphony".into()))?;
-        let mut command = Command::new(&exe);
-        command.arg("stdio").arg("--workspace").arg(&request.cwd);
-        if let Some(resume) = &request.resume {
-            command.arg("--session-id").arg(resume);
-        }
-        if let Some(model) = &request.model {
-            if model != "default" {
-                command.arg("--model").arg(model);
-            }
-        }
-        if request.auto_approve {
-            command.arg("--unattended");
-        }
-        Self::configure(&mut command, &exe);
-        command
-            .current_dir(&request.cwd)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        crate::compose_child_path(&mut command, &exe);
-        let mut child = command.spawn()?;
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| HarnessError::Protocol("no Symphony stdin".into()))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| HarnessError::Protocol("no Symphony stdout".into()))?;
-        // Drain diagnostics independently so a verbose provider cannot block its stdout.
-        if let Some(stderr) = child.stderr.take() {
-            tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::debug!("Symphony: {line}");
-                }
-            });
-        }
+        let sessions = self.sessions.clone();
         let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            let mut session_id = request.resume.clone();
-            let mut ended = false;
-            let mut interrupted = false;
-            let mut started = false;
-            let mut error = None;
-            let mut subagents = SubagentMapper::default();
-            // Symphony emits ready before accepting a prompt.
-            loop {
-                let next = tokio::select! {
-                    _ = controls.interrupt.cancelled() => {
-                        interrupted = true;
-                        let _ = stdin.write_all(b"{\"type\":\"interrupt\"}\n").await;
-                        break;
-                    }
-                    line = lines.next_line() => line,
-                };
-                let Ok(Some(line)) = next else { break };
+            drive_session(sessions, exe, request, controls, tx).await;
+        });
+        Ok(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (event, rx))
+        })
+        .boxed())
+    }
+}
+
+async fn shared_session_id(shared: &Shared) -> String {
+    shared.bridge.lock().await.session_id.clone()
+}
+
+impl SymphonyHarness {
+    async fn catalog_models(&self) -> Result<Vec<Model>, HarnessError> {
+        let mut slot = self.sessions.catalog.lock().await;
+        let spawn_catalog = |slot: &mut Option<Bridge>| -> Result<(), HarnessError> {
+            let exe =
+                Self::executable().ok_or_else(|| HarnessError::NotInstalled("symphony".into()))?;
+            let mut command = crate::process::Command::new(&exe);
+            command.arg("stdio");
+            Self::configure(&mut command, &exe);
+            crate::compose_child_path(&mut command, &exe);
+            *slot = Some(launch(&mut command, "", false, None)?);
+            Ok(())
+        };
+        if slot
+            .as_mut()
+            .is_none_or(|bridge| !child_running(&mut bridge.child))
+        {
+            if let Some(bridge) = slot.as_mut() {
+                reap(bridge).await;
+            }
+            *slot = None;
+            spawn_catalog(&mut slot)?;
+            if let Err(err) =
+                accept_ready(slot.as_mut().expect("catalog just spawned"), None, false).await
+            {
+                if let Some(bridge) = slot.as_mut() {
+                    reap(bridge).await;
+                }
+                *slot = None;
+                return Err(err);
+            }
+        }
+        let bridge = slot.as_mut().expect("catalog bridge");
+        match list_models(bridge).await {
+            Ok(models) => Ok(models),
+            Err(err) => {
+                reap(bridge).await;
+                *slot = None;
+                Err(err)
+            }
+        }
+    }
+}
+
+async fn drive_session(
+    sessions: Arc<SessionTable>,
+    exe: std::path::PathBuf,
+    request: RunRequest,
+    controls: RunControls,
+    tx: mpsc::UnboundedSender<Result<AgentEvent, HarnessError>>,
+) {
+    let shared = match take_matching(&sessions, &request).await {
+        Some(shared) => shared,
+        None => {
+            let model = launched_model(request.model.as_deref());
+            let mut command = run_command(&exe, &request);
+            match launch(&mut command, &request.cwd, request.auto_approve, model) {
+                Ok(bridge) => Arc::new(Shared {
+                    stop: crate::CancellationToken::new(),
+                    bridge: Mutex::new(bridge),
+                }),
+                Err(err) => {
+                    let _ = tx.send(Ok(AgentEvent::Done {
+                        status: DoneStatus::Errored,
+                        result: None,
+                        error: Some(err.to_string()),
+                        session_id: request.resume.clone(),
+                    }));
+                    return;
+                }
+            }
+        }
+    };
+    let mut bridge = shared.bridge.lock().await;
+    if bridge.session_id.is_empty() {
+        if let Err(err) = accept_ready(&mut bridge, request.model.as_deref(), true).await {
+            reap(&mut bridge).await;
+            let _ = tx.send(Ok(AgentEvent::Done {
+                status: DoneStatus::Errored,
+                result: None,
+                error: Some(err.to_string()),
+                session_id: request.resume.clone(),
+            }));
+            return;
+        }
+        sessions.insert(bridge.session_id.clone(), shared.clone());
+    }
+    let mut ended = false;
+    let mut interrupted = false;
+    let mut interrupt_sent = false;
+    let mut started = true;
+    let mut error = None;
+    let mut kill = false;
+    let mut subagents = SubagentMapper::default();
+    let session_id = bridge.session_id.clone();
+    let model_name = bridge.model_name.clone();
+    let _ = tx.send(Ok(AgentEvent::SessionStarted {
+        harness: HarnessId::Symphony,
+        model: model_name,
+        tools: vec![],
+        cwd: request.cwd.clone(),
+        session_id: session_id.clone(),
+        assistant_message_id: uuid::Uuid::new_v4().to_string(),
+    }));
+    let line = json!({"type":"run", "prompt": request.prompt, "attachments": request.attachments})
+        .to_string()
+        + "\n";
+    if bridge.stdin.write_all(line.as_bytes()).await.is_err() {
+        started = false;
+        kill = true;
+    }
+    let mut deadline: Option<tokio::time::Instant> = None;
+    while !kill && !ended {
+        let stop = shared.stop.clone();
+        let wake = tokio::select! {
+            biased;
+            _ = stop.cancelled() => DriveWake::Stop,
+            _ = controls.interrupt.cancelled(), if !interrupt_sent => DriveWake::Interrupt,
+            _ = async {
+                match deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => DriveWake::Timeout,
+            line = bridge.lines.next_line() => DriveWake::Line(line),
+        };
+        match wake {
+            DriveWake::Stop => {
+                kill = true;
+                interrupted = true;
+                break;
+            }
+            DriveWake::Interrupt => {
+                interrupted = true;
+                interrupt_sent = true;
+                let _ = bridge.stdin.write_all(b"{\"type\":\"interrupt\"}\n").await;
+                deadline = Some(tokio::time::Instant::now() + INTERRUPT_GRACE);
+            }
+            DriveWake::Timeout => {
+                kill = true;
+                interrupted = true;
+                break;
+            }
+            DriveWake::Line(Err(_)) | DriveWake::Line(Ok(None)) => {
+                kill = true;
+                break;
+            }
+            DriveWake::Line(Ok(Some(line))) => {
                 let Ok(frame) = serde_json::from_str::<Value>(&line) else {
                     continue;
                 };
                 match field(&frame, "type") {
-                    "ready" => {
-                        if let Err(err) = check_version(&frame) {
-                            error = Some(err.to_string());
-                            break;
-                        }
-                        if let Err(err) =
-                            check_ready_model(request.model.as_deref(), field(&frame, "model"))
-                        {
-                            error = Some(err.to_string());
-                            break;
-                        }
-                        session_id = Some(field(&frame, "session_id").into());
-                        let _ = tx.send(Ok(AgentEvent::SessionStarted {
-                            harness: HarnessId::Symphony,
-                            model: field(&frame, "model").into(),
-                            tools: vec![],
-                            cwd: request.cwd.clone(),
-                            session_id: session_id.clone().unwrap_or_default(),
-                            assistant_message_id: uuid::Uuid::new_v4().to_string(),
-                        }));
-                        let line =
-                            json!({"type":"run", "prompt":request.prompt, "attachments":request.attachments}).to_string() + "\n";
-                        if stdin.write_all(line.as_bytes()).await.is_err() {
-                            break;
-                        }
-                        started = true;
-                    }
                     "event" => {
                         for mapped in subagents.map(field(&frame, "event"), &frame["payload"]) {
                             let _ = tx.send(Ok(mapped));
@@ -574,17 +891,34 @@ impl Harness for SymphonyHarness {
                             options: choices,
                             multi_select: false,
                         }]);
-                        let answer = tokio::select! {
-                            result = receiver => result.ok().and_then(|answers| answers.first().and_then(|a| a.labels.first().cloned())),
-                            _ = controls.interrupt.cancelled() => { interrupted = true; None },
+                        let stop = shared.stop.clone();
+                        let answered = tokio::select! {
+                            biased;
+                            _ = stop.cancelled() => InputWake::Stop,
+                            _ = controls.interrupt.cancelled() => InputWake::Interrupt,
+                            result = receiver => InputWake::Answer(result.ok().and_then(|answers| {
+                                answers.first().and_then(|answer| answer.labels.first().cloned())
+                            })),
                         };
-                        if interrupted {
-                            break;
-                        }
-                        // Closing the prompt is a denial, never an implicit approval.
-                        let line = json!({"type":"answer", "request_id":request_id, "value":answer.unwrap_or_else(|| "Deny".into())}).to_string() + "\n";
-                        if stdin.write_all(line.as_bytes()).await.is_err() {
-                            break;
+                        match answered {
+                            InputWake::Stop => {
+                                kill = true;
+                                interrupted = true;
+                                break;
+                            }
+                            InputWake::Interrupt => {
+                                interrupted = true;
+                                interrupt_sent = true;
+                                let _ = bridge.stdin.write_all(b"{\"type\":\"interrupt\"}\n").await;
+                                deadline = Some(tokio::time::Instant::now() + INTERRUPT_GRACE);
+                            }
+                            InputWake::Answer(answer) => {
+                                let line = json!({"type":"answer", "request_id": request_id, "value": answer.unwrap_or_else(|| "Deny".into())}).to_string() + "\n";
+                                if bridge.stdin.write_all(line.as_bytes()).await.is_err() {
+                                    kill = true;
+                                    break;
+                                }
+                            }
                         }
                     }
                     "error" => {
@@ -597,50 +931,64 @@ impl Harness for SymphonyHarness {
                             "interrupted" => DoneStatus::Interrupted,
                             _ => DoneStatus::Errored,
                         };
+                        // A clean interrupted done is the checkpoint. Do not kill.
                         let _ = tx.send(Ok(AgentEvent::Done {
                             status,
                             result: None,
                             error: error.clone(),
-                            session_id: session_id.clone(),
+                            session_id: Some(session_id.clone()),
                         }));
-                        break;
                     }
                     _ => {}
                 }
             }
-            if !ended {
-                let _ = tx.send(Ok(AgentEvent::Done {
-                    status: if interrupted {
-                        DoneStatus::Interrupted
-                    } else {
-                        DoneStatus::Errored
-                    },
-                    result: None,
-                    error: if interrupted {
-                        None
-                    } else {
-                        error.or_else(|| {
-                            Some(
-                                if started {
-                                    "Symphony exited before completing the turn"
-                                } else {
-                                    "Symphony failed to start"
-                                }
-                                .into(),
-                            )
-                        })
-                    },
-                    session_id,
-                }));
-            }
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-        });
-        Ok(futures::stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|event| (event, rx))
-        })
-        .boxed())
+        }
     }
+    if !ended {
+        let _ = tx.send(Ok(AgentEvent::Done {
+            status: if interrupted {
+                DoneStatus::Interrupted
+            } else {
+                DoneStatus::Errored
+            },
+            result: None,
+            error: if interrupted {
+                None
+            } else {
+                error.or_else(|| {
+                    Some(
+                        if started {
+                            "Symphony exited before completing the turn"
+                        } else {
+                            "Symphony failed to start"
+                        }
+                        .into(),
+                    )
+                })
+            },
+            session_id: Some(session_id.clone()),
+        }));
+    }
+    let released = shared.stop.is_cancelled();
+    let dead = !child_running(&mut bridge.child);
+    if kill || released || dead {
+        reap(&mut bridge).await;
+        drop(bridge);
+        sessions.remove_if_same(&session_id, &shared);
+    }
+}
+
+enum DriveWake {
+    Stop,
+    Interrupt,
+    Timeout,
+    Line(std::io::Result<Option<String>>),
+}
+
+enum InputWake {
+    Stop,
+    Interrupt,
+    Answer(Option<String>),
 }
 
 fn check_version(frame: &Value) -> Result<(), HarnessError> {
@@ -673,6 +1021,64 @@ fn check_ready_model(requested: Option<&str>, actual: &str) -> Result<(), Harnes
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_file_and_patch_use_symphony_schema_names() {
+        assert_eq!(
+            map_event(
+                "tool_execution_started",
+                &json!({
+                    "tool_call_id": "w1",
+                    "tool_name": "write_file",
+                    "arguments": {"path": "a.txt", "content": "hello\n"}
+                })
+            ),
+            Some(AgentEvent::ToolCall {
+                id: "w1".into(),
+                call: ToolCall::WriteFile {
+                    path: "a.txt".into(),
+                    content: Some("hello\n".into()),
+                },
+            }),
+        );
+        assert_eq!(
+            map_event(
+                "tool_execution_started",
+                &json!({
+                    "tool_call_id": "p1",
+                    "tool_name": "patch",
+                    "arguments": {
+                        "path": "a.txt",
+                        "old_str": "hello",
+                        "new_str": "world",
+                        "replace_all": false,
+                        "old_string": "ignored",
+                        "new_string": "ignored"
+                    }
+                })
+            ),
+            Some(AgentEvent::ToolCall {
+                id: "p1".into(),
+                call: ToolCall::EditFile {
+                    path: "a.txt".into(),
+                    old_string: Some("hello".into()),
+                    new_string: Some("world".into()),
+                },
+            }),
+        );
+        assert_eq!(
+            map_event(
+                "tool_execution_completed",
+                &json!({"tool_call_id": "w1", "status": "success", "result": "wrote a.txt"})
+            ),
+            Some(AgentEvent::ToolResult {
+                id: "w1".into(),
+                is_error: false,
+                output: Some("wrote a.txt".into()),
+                diff: None,
+            }),
+        );
+    }
 
     #[test]
     fn maps_streamed_text_and_tools() {

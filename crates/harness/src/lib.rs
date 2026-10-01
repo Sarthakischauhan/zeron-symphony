@@ -159,6 +159,11 @@ pub trait Harness: Send + Sync {
         ))
     }
 
+    /// Drop a process this driver kept for `session_id`. Default is a no-op.
+    /// Symphony uses this on Zeron session drop and engine shutdown; a
+    /// successful turn must not be what kills the child.
+    fn release_session(&self, _session_id: &str) {}
+
     /// Run one (persistent) session; the stream ends with `AgentEvent::Done`.
     async fn run(
         &self,
@@ -183,11 +188,11 @@ pub(crate) mod jsonrpc;
 pub mod mock;
 mod model_context;
 pub mod opencode;
-pub mod symphony;
 pub mod process;
 mod scratch;
 pub mod shell_env;
 pub(crate) mod skills;
+pub mod symphony;
 #[cfg(windows)]
 pub mod windows_process;
 
