@@ -293,8 +293,21 @@ fn map_event(event: &str, payload: &Value) -> Option<AgentEvent> {
         "assistant_message_completed" => Some(AgentEvent::AssistantMessageCompleted {
             assistant_message_id: field(payload, "assistant_message_id").into(),
         }),
+        "context_usage" => context_usage_event(payload),
         _ => None,
     }
+}
+
+/// Symphony `context_usage`: `tokens` is this chat's sent occupancy and
+/// `window` is the model limit. Missing fields stay unset. A zero window is
+/// not a measurement.
+fn context_usage_event(payload: &Value) -> Option<AgentEvent> {
+    let tokens = payload.get("tokens").and_then(Value::as_u64);
+    let window = payload
+        .get("window")
+        .and_then(Value::as_u64)
+        .filter(|window| *window > 0);
+    (tokens.is_some() || window.is_some()).then_some(AgentEvent::ContextUsage { tokens, window })
 }
 
 fn catalog_models(frame: &Value, request_id: &str) -> Result<Vec<Model>, HarnessError> {
@@ -1141,6 +1154,70 @@ mod tests {
                 output: Some("wrote a.txt".into()),
                 diff: None,
             }),
+        );
+    }
+
+    #[test]
+    fn maps_context_usage_without_inventing_missing_fields() {
+        assert_eq!(
+            map_event("context_usage", &json!({"tokens": 1500, "window": 32000})),
+            Some(AgentEvent::ContextUsage {
+                tokens: Some(1500),
+                window: Some(32000),
+            }),
+        );
+        assert_eq!(
+            map_event("context_usage", &json!({"tokens": 0})),
+            Some(AgentEvent::ContextUsage {
+                tokens: Some(0),
+                window: None,
+            }),
+        );
+        assert_eq!(
+            map_event("context_usage", &json!({"window": 0, "tokens": 12})),
+            Some(AgentEvent::ContextUsage {
+                tokens: Some(12),
+                window: None,
+            }),
+        );
+        assert_eq!(
+            map_event("context_usage", &json!({"window": 8000})),
+            Some(AgentEvent::ContextUsage {
+                tokens: None,
+                window: Some(8000),
+            }),
+        );
+        assert_eq!(map_event("context_usage", &json!({})), None);
+        // The billing `context` event is a different measurement. Do not map it.
+        assert_eq!(
+            map_event("context", &json!({"tokens_used": 9, "context_limit": 10})),
+            None
+        );
+    }
+
+    #[test]
+    fn child_context_usage_stays_on_the_spawn_chip() {
+        let mut mapper = SubagentMapper::default();
+        mapper.map(
+            "agent_spawned",
+            &json!({"child_id":"child-1", "tool_call_id":"spawn-1", "prompt":"task"}),
+        );
+        let child = mapper.map(
+            "context_usage",
+            &json!({"agent_id":"child-1", "tokens": 999, "window": 1000}),
+        );
+        assert!(matches!(
+            &child[..],
+            [AgentEvent::Subagent { parent_tool_use_id, event }]
+                if parent_tool_use_id == "spawn-1"
+                    && matches!(event.as_ref(), AgentEvent::ContextUsage { tokens: Some(999), window: Some(1000) })
+        ));
+        assert_eq!(
+            mapper.map("context_usage", &json!({"tokens": 40, "window": 80})),
+            vec![AgentEvent::ContextUsage {
+                tokens: Some(40),
+                window: Some(80),
+            }]
         );
     }
 

@@ -5394,6 +5394,9 @@ pub struct Composer {
     /// session navigation, which must continue to snap.
     launching_new_chat: bool,
     pub(crate) failure: Option<SharedString>,
+    /// A picker-confirmed slash command sends only that line. If the send
+    /// fails, put this whole draft back instead of the command alone.
+    isolated_submit_restore: Option<String>,
     /// The chat key `failure` belongs to (`None` = global, e.g. "Engine not
     /// connected"). Chat-scoped failures survive navigation and render only
     /// under their own chat — a blanket clear-on-switch erased the one
@@ -5500,6 +5503,45 @@ pub struct Composer {
 }
 
 impl EventEmitter<ComposerEvent> for Composer {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlashPickerConfirm {
+    /// Leave the selection in the composer (skills, free-typed arguments).
+    Insert,
+    /// The command advertises choices; show them instead of running a bare name.
+    ChooseArgument,
+    /// Run this command now. The prompt is only the slash line.
+    Run,
+}
+
+/// What confirming the highlighted slash row does.
+fn slash_picker_confirm(command: &InvocationCandidate) -> SlashPickerConfirm {
+    if matches!(
+        command.invocation,
+        zeron_proto::invocation::Invocation::Skill { .. }
+    ) {
+        return SlashPickerConfirm::Insert;
+    }
+    if command.argument.is_some() {
+        return SlashPickerConfirm::Run;
+    }
+    if !command.options.is_empty() {
+        return SlashPickerConfirm::ChooseArgument;
+    }
+    if command.input_hint.is_some() {
+        return SlashPickerConfirm::Insert;
+    }
+    SlashPickerConfirm::Run
+}
+
+fn confirmed_slash_prompt(command: &InvocationCandidate) -> String {
+    let mut prompt = command.invocation.prompt_text();
+    if let Some(argument) = command.argument.as_deref() {
+        prompt.push(' ');
+        prompt.push_str(argument);
+    }
+    prompt
+}
 
 impl Composer {
     pub(crate) fn set_dock_frame(
@@ -5655,6 +5697,7 @@ impl Composer {
             sending: false,
             launching_new_chat: false,
             failure: None,
+            isolated_submit_restore: None,
             wizard: None,
             wizard_focus: cx.focus_handle(),
             answered_requests: HashSet::new(),
@@ -7222,6 +7265,62 @@ impl Composer {
         cx.notify();
     }
 
+    /// Run a confirmed slash command the way Enter would, without the rest
+    /// of the draft or its attachments.
+    fn run_confirmed_slash(&mut self, prompt: String, token: Range<usize>, cx: &mut Context<Self>) {
+        let key = self.current_key.clone();
+        let original = self.input.read(cx).text().to_string();
+        let attachments = self.attachments.remove(&key);
+        let appshots = self.appshots.remove(&key);
+        let comments = self
+            .state
+            .update(cx, |state, _| state.take_review_comments(&key));
+        self.input
+            .update(cx, |input, cx| input.remove_completion_token(token, cx));
+        let remainder = self.input.read(cx).text().to_string();
+        // The command is the submission, even though it just left the draft.
+        // A live run queues it; Stop is only for an empty composer.
+        let queue = self.run_live(cx);
+        let blocked = self.send_blocked(cx);
+        self.reset_slash(None, cx);
+        if blocked {
+            self.input
+                .update(cx, |input, cx| input.set_text(&original, cx));
+        } else {
+            self.isolated_submit_restore = Some(original.clone());
+            self.send(prompt, queue, cx);
+            if self.failure.is_some() {
+                self.input
+                    .update(cx, |input, cx| input.set_text(&original, cx));
+            } else {
+                self.input
+                    .update(cx, |input, cx| input.set_text(&remainder, cx));
+                if remainder.is_empty() {
+                    self.drafts.remove(&key);
+                } else {
+                    self.drafts.insert(key.clone(), remainder);
+                }
+            }
+        }
+        if let Some(mut items) = attachments {
+            items.extend(self.attachments.remove(&key).unwrap_or_default());
+            self.attachments.insert(key.clone(), items);
+        }
+        if let Some(mut items) = appshots {
+            items.extend(self.appshots.remove(&key).unwrap_or_default());
+            self.appshots.insert(key.clone(), items);
+        }
+        if !comments.is_empty() {
+            let key = key.clone();
+            self.state.update(cx, |state, _| {
+                for comment in comments {
+                    state.add_review_comment(&key, comment);
+                }
+            });
+        }
+        cx.notify();
+    }
+
     fn accept_slash(&mut self, cx: &mut Context<Self>) {
         let Some(token) = self.slash.token.clone() else {
             return;
@@ -7241,6 +7340,10 @@ impl Composer {
         };
         if let Some(action) = command.workspace_command {
             self.execute_workspace_command(action, token.range, cx);
+            return;
+        }
+        if slash_picker_confirm(&command) == SlashPickerConfirm::Run {
+            self.run_confirmed_slash(confirmed_slash_prompt(&command), token.range, cx);
             return;
         }
         let mut insertion =
@@ -7796,6 +7899,7 @@ impl Composer {
     /// is on), `Mutate createChat` with the `ChatConfig` + cwd, and the model /
     /// reasoning / options on the Run request itself (§1.7).
     fn send(&mut self, text: String, queue: bool, cx: &mut Context<Self>) {
+        let isolated_restore = self.isolated_submit_restore.take();
         if !self.check_reference_delivery(&text, cx) {
             return;
         }
@@ -7821,10 +7925,16 @@ impl Composer {
             if words.next() == Some("/effort") {
                 if let Some(effort) = words.next().map(str::to_lowercase) {
                     if words.next().is_none()
-                        && matches!(effort.as_str(), "default" | "none" | "low" | "medium" | "high" | "xhigh" | "max")
-                        && self.staged().is_empty() && self.staged_appshots().is_empty()
+                        && matches!(
+                            effort.as_str(),
+                            "default" | "none" | "low" | "medium" | "high" | "xhigh" | "max"
+                        )
+                        && self.staged().is_empty()
+                        && self.staged_appshots().is_empty()
                     {
-                        self.pickers.update(cx, |pickers, cx| pickers.select_symphony_effort_command(&effort, cx));
+                        self.pickers.update(cx, |pickers, cx| {
+                            pickers.select_symphony_effort_command(&effort, cx)
+                        });
                     }
                 }
             }
@@ -8087,7 +8197,7 @@ impl Composer {
         }
         cx.notify();
 
-        let restore_text = typed;
+        let restore_text = isolated_restore.unwrap_or(typed);
         let err_chat_id = chat_id.clone();
         let err_message_id = message_id.clone();
         self.send_task = Some(cx.spawn(async move |this, cx| {
@@ -10688,44 +10798,31 @@ mod tests {
                     path: "/repo/SKILL.md".into(),
                     command: None,
                 };
-                for invocation in [
-                    zeron_proto::invocation::Invocation::Command {
+                let draft = "café /rev after";
+                composer
+                    .input
+                    .update(cx, |input, cx| input.set_text(draft, cx));
+                composer.update_slash(draft, "café /rev".len(), cx);
+                composer.slash_cache.insert(
+                    composer.slash.context.clone(),
+                    vec![InvocationCandidate {
+                        options: vec![],
+                        argument: None,
                         name: "review".into(),
-                    },
-                    skill,
-                ] {
-                    let draft = "café /rev after";
-                    composer
-                        .input
-                        .update(cx, |input, cx| input.set_text(draft, cx));
-                    composer.update_slash(draft, "café /rev".len(), cx);
-                    composer.slash_cache.insert(
-                        composer.slash.context.clone(),
-                        vec![InvocationCandidate {
-                            options: vec![],
-                            argument: None,
-                            name: "review".into(),
-                            description: String::new(),
-                            input_hint: None,
-                            workspace_command: None,
-                            invocation: invocation.clone(),
-                        }],
-                    );
-                    composer.refilter_slash(cx);
-                    composer.accept_slash(cx);
-                    assert_eq!(
-                        composer.input.read(cx).text(),
-                        format!(
-                            "café {} after",
-                            match &invocation {
-                                zeron_proto::invocation::Invocation::Command { .. } =>
-                                    "/review".to_string(),
-                                _ => invocation.link(),
-                            }
-                        )
-                    );
-                    assert!(composer.failure.is_none());
-                }
+                        description: String::new(),
+                        input_hint: None,
+                        workspace_command: None,
+                        invocation: skill.clone(),
+                    }],
+                );
+                composer.refilter_slash(cx);
+                composer.accept_slash(cx);
+                assert_eq!(
+                    composer.input.read(cx).text(),
+                    format!("café {} after", skill.link())
+                );
+                assert!(composer.failure.is_none());
+                assert_eq!(composer.staged()[0].id, attachment_id);
             })
             .unwrap();
     }
@@ -12910,10 +13007,67 @@ mod tests {
         }
     }
 
+    #[test]
+    fn slash_picker_confirm_runs_ready_commands_and_inserts_the_rest() {
+        let command =
+            |name: &str, hint: Option<&str>, options: Vec<&str>, argument: Option<&str>| {
+                InvocationCandidate {
+                    workspace_command: None,
+                    name: name.into(),
+                    description: String::new(),
+                    input_hint: hint.map(str::to_string),
+                    options: options
+                        .into_iter()
+                        .map(|value| zeron_proto::SlashCommandOption {
+                            value: value.into(),
+                            label: String::new(),
+                            description: String::new(),
+                        })
+                        .collect(),
+                    argument: argument.map(str::to_string),
+                    invocation: zeron_proto::invocation::Invocation::Command { name: name.into() },
+                }
+            };
+        assert_eq!(
+            slash_picker_confirm(&command("personality", Some("id"), vec!["precise"], None)),
+            SlashPickerConfirm::ChooseArgument
+        );
+        let chosen = command("personality", None, vec![], Some("precise"));
+        assert_eq!(slash_picker_confirm(&chosen), SlashPickerConfirm::Run);
+        assert_eq!(confirmed_slash_prompt(&chosen), "/personality precise");
+        assert_eq!(
+            slash_picker_confirm(&command("compact", None, vec![], None)),
+            SlashPickerConfirm::Run
+        );
+        assert_eq!(
+            slash_picker_confirm(&command("review", Some("note"), vec![], None)),
+            SlashPickerConfirm::Insert
+        );
+        let skill = InvocationCandidate {
+            workspace_command: None,
+            name: "review".into(),
+            description: String::new(),
+            input_hint: None,
+            options: vec![],
+            argument: None,
+            invocation: zeron_proto::invocation::Invocation::Skill {
+                name: "review".into(),
+                path: "/repo/SKILL.md".into(),
+                command: None,
+            },
+        };
+        assert_eq!(slash_picker_confirm(&skill), SlashPickerConfirm::Insert);
+    }
+
     #[gpui::test]
-    fn personality_argument_picker_inserts_argument_not_command_name(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn personality_argument_picker_runs_the_choice(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let (out, mut requests) = tokio::sync::mpsc::channel::<String>(64);
+        let (_replies, inbound) = tokio::sync::mpsc::channel::<String>(16);
         let (_dir, handle) = composer_focus_window(cx);
         handle
             .update(cx, |composer, _, cx| {
@@ -12931,9 +13085,14 @@ mod tests {
                     vec![],
                 );
                 composer.slash_cache.insert("catalog".into(), rows);
-                composer.input.update(cx, |input, cx| input.set_text("/personality", cx));
+                composer
+                    .input
+                    .update(cx, |input, cx| input.set_text("/personality", cx));
                 composer.slash.context = "catalog".into();
-                composer.slash.token = Some(MentionToken { range: 0..12, query: "personality".into() });
+                composer.slash.token = Some(MentionToken {
+                    range: 0..12,
+                    query: "personality".into(),
+                });
                 composer.slash.filtered = vec![0];
                 composer.slash.active = Some(0);
                 composer.accept_slash(cx);
@@ -12949,14 +13108,128 @@ mod tests {
                     cx
                 ));
                 assert_eq!(composer.slash.filtered.len(), 1);
+                composer.state.update(cx, |state, _| {
+                    state.set_test_engine(crate::state::EngineHandle::from_test_client(
+                        zeron_rpc::RpcClient::new(out, inbound),
+                    ));
+                    state.selected_chat = Some("chat".into());
+                });
+                let attachment = attachments::stage_png_bytes("draft.png".into(), Vec::new());
+                let attachment_id = attachment.id.clone();
+                composer
+                    .attachments
+                    .insert(composer.current_key.clone(), vec![attachment]);
+                composer.editing_queued = Some("queued-draft".into());
                 composer.accept_slash(cx);
-                let text = composer.input.read(cx).text();
-                assert_eq!(
-                    zeron_proto::invocation::invocation_prompt(text).trim(),
-                    "/personality precise"
-                );
+                assert!(composer.input.read(cx).text().is_empty());
+                assert!(composer.slash.token.is_none());
+                assert!(composer.failure.is_none());
+                assert_eq!(composer.staged()[0].id, attachment_id);
+                assert_eq!(composer.editing_queued.as_deref(), Some("queued-draft"));
             })
             .unwrap();
+        cx.run_until_parked();
+        let mut prompts = Vec::new();
+        while let Ok(frame) = requests.try_recv() {
+            let frame: zeron_rpc::ClientFrame = serde_json::from_str(&frame).unwrap();
+            if frame.method.as_deref() == Some(methods::QUEUE_COMMAND) {
+                prompts.push(
+                    frame.params["command"]["request"]["prompt"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned(),
+                );
+            }
+        }
+        assert_eq!(prompts, vec!["/personality precise".to_string()]);
+    }
+
+    #[gpui::test]
+    fn bare_command_picker_runs_without_the_surrounding_draft(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let (out, mut requests) = tokio::sync::mpsc::channel::<String>(64);
+        let (_replies, inbound) = tokio::sync::mpsc::channel::<String>(16);
+        let (_dir, handle) = composer_focus_window(cx);
+        handle
+            .update(cx, |composer, _, cx| {
+                composer.state.update(cx, |state, _| {
+                    state.set_test_engine(crate::state::EngineHandle::from_test_client(
+                        zeron_rpc::RpcClient::new(out, inbound),
+                    ));
+                    state.selected_chat = Some("chat".into());
+                });
+                let attachment = attachments::stage_png_bytes("shot.png".into(), Vec::new());
+                let attachment_id = attachment.id.clone();
+                composer
+                    .attachments
+                    .insert(composer.current_key.clone(), vec![attachment]);
+                let draft = "please /comp extra";
+                composer
+                    .input
+                    .update(cx, |input, cx| input.set_text(draft, cx));
+                composer.update_slash(draft, "please /comp".len(), cx);
+                composer.slash_cache.insert(
+                    composer.slash.context.clone(),
+                    vec![InvocationCandidate {
+                        options: vec![],
+                        argument: None,
+                        name: "compact".into(),
+                        description: String::new(),
+                        input_hint: None,
+                        workspace_command: None,
+                        invocation: zeron_proto::invocation::Invocation::Command {
+                            name: "compact".into(),
+                        },
+                    }],
+                );
+                composer.refilter_slash(cx);
+                composer.accept_slash(cx);
+                assert_eq!(composer.input.read(cx).text(), "please extra");
+                assert_eq!(composer.staged()[0].id, attachment_id);
+                assert!(composer.failure.is_none());
+                let hinted = "keep /rev";
+                composer
+                    .input
+                    .update(cx, |input, cx| input.set_text(hinted, cx));
+                composer.update_slash(hinted, hinted.len(), cx);
+                composer.slash_cache.insert(
+                    composer.slash.context.clone(),
+                    vec![InvocationCandidate {
+                        options: vec![],
+                        argument: None,
+                        name: "review".into(),
+                        description: String::new(),
+                        input_hint: Some("note".into()),
+                        workspace_command: None,
+                        invocation: zeron_proto::invocation::Invocation::Command {
+                            name: "review".into(),
+                        },
+                    }],
+                );
+                composer.refilter_slash(cx);
+                composer.accept_slash(cx);
+                assert_eq!(composer.input.read(cx).text(), "keep /review ");
+                assert_eq!(composer.staged()[0].id, attachment_id);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let mut prompts = Vec::new();
+        while let Ok(frame) = requests.try_recv() {
+            let frame: zeron_rpc::ClientFrame = serde_json::from_str(&frame).unwrap();
+            if frame.method.as_deref() == Some(methods::QUEUE_COMMAND) {
+                prompts.push(
+                    frame.params["command"]["request"]["prompt"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned(),
+                );
+            }
+        }
+        assert_eq!(prompts, vec!["/compact".to_string()]);
     }
 
     #[test]
