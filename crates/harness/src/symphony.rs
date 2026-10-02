@@ -293,21 +293,39 @@ fn map_event(event: &str, payload: &Value) -> Option<AgentEvent> {
         "assistant_message_completed" => Some(AgentEvent::AssistantMessageCompleted {
             assistant_message_id: field(payload, "assistant_message_id").into(),
         }),
-        "context_usage" => context_usage_event(payload),
+        "context" => footer_context_usage(payload, "tokens_used"),
+        "compaction_completed" => compaction_context_usage(payload),
         _ => None,
     }
 }
 
-/// Symphony `context_usage`: `tokens` is this chat's sent occupancy and
-/// `window` is the model limit. Missing fields stay unset. A zero window is
-/// not a measurement.
-fn context_usage_event(payload: &Value) -> Option<AgentEvent> {
-    let tokens = payload.get("tokens").and_then(Value::as_u64);
+/// The TUI footer meter reads `tokens_used` and `context_limit` off the
+/// existing `context` event. A missing field stays unset so the last
+/// measurement remains. A zero window is not a measurement.
+fn footer_context_usage(payload: &Value, tokens_key: &str) -> Option<AgentEvent> {
+    let tokens = payload.get(tokens_key).and_then(Value::as_u64);
     let window = payload
-        .get("window")
+        .get("context_limit")
         .and_then(Value::as_u64)
         .filter(|window| *window > 0);
     (tokens.is_some() || window.is_some()).then_some(AgentEvent::ContextUsage { tokens, window })
+}
+
+/// `compaction_completed` moves the footer only when it carries
+/// `estimated_tokens_after`. Without that estimate the footer leaves the
+/// meter alone, even if `context_limit` is present.
+fn compaction_context_usage(payload: &Value) -> Option<AgentEvent> {
+    let tokens = payload
+        .get("estimated_tokens_after")
+        .and_then(Value::as_u64)?;
+    let window = payload
+        .get("context_limit")
+        .and_then(Value::as_u64)
+        .filter(|window| *window > 0);
+    Some(AgentEvent::ContextUsage {
+        tokens: Some(tokens),
+        window,
+    })
 }
 
 fn catalog_models(frame: &Value, request_id: &str) -> Result<Vec<Model>, HarnessError> {
@@ -1158,53 +1176,76 @@ mod tests {
     }
 
     #[test]
-    fn maps_context_usage_without_inventing_missing_fields() {
+    fn maps_context_event_the_way_the_tui_footer_does() {
         assert_eq!(
-            map_event("context_usage", &json!({"tokens": 1500, "window": 32000})),
+            map_event(
+                "context",
+                &json!({"tokens_used": 1500, "context_limit": 32000})
+            ),
             Some(AgentEvent::ContextUsage {
                 tokens: Some(1500),
                 window: Some(32000),
             }),
         );
         assert_eq!(
-            map_event("context_usage", &json!({"tokens": 0})),
+            map_event("context", &json!({"tokens_used": 0})),
             Some(AgentEvent::ContextUsage {
                 tokens: Some(0),
                 window: None,
             }),
         );
         assert_eq!(
-            map_event("context_usage", &json!({"window": 0, "tokens": 12})),
+            map_event("context", &json!({"context_limit": 0, "tokens_used": 12})),
             Some(AgentEvent::ContextUsage {
                 tokens: Some(12),
                 window: None,
             }),
         );
         assert_eq!(
-            map_event("context_usage", &json!({"window": 8000})),
+            map_event("context", &json!({"context_limit": 8000})),
             Some(AgentEvent::ContextUsage {
                 tokens: None,
                 window: Some(8000),
             }),
         );
-        assert_eq!(map_event("context_usage", &json!({})), None);
-        // The billing `context` event is a different measurement. Do not map it.
+        assert_eq!(map_event("context", &json!({})), None);
+        // The footer updates from compaction only when the after-estimate exists.
         assert_eq!(
-            map_event("context", &json!({"tokens_used": 9, "context_limit": 10})),
+            map_event(
+                "compaction_completed",
+                &json!({"estimated_tokens_after": 25000, "context_limit": 200000})
+            ),
+            Some(AgentEvent::ContextUsage {
+                tokens: Some(25000),
+                window: Some(200000),
+            }),
+        );
+        assert_eq!(
+            map_event(
+                "compaction_completed",
+                &json!({"estimated_tokens_after": 30, "context_limit": 0})
+            ),
+            Some(AgentEvent::ContextUsage {
+                tokens: Some(30),
+                window: None,
+            }),
+        );
+        assert_eq!(
+            map_event("compaction_completed", &json!({"context_limit": 8000})),
             None
         );
     }
 
     #[test]
-    fn child_context_usage_stays_on_the_spawn_chip() {
+    fn child_context_event_stays_on_the_spawn_chip() {
         let mut mapper = SubagentMapper::default();
         mapper.map(
             "agent_spawned",
             &json!({"child_id":"child-1", "tool_call_id":"spawn-1", "prompt":"task"}),
         );
         let child = mapper.map(
-            "context_usage",
-            &json!({"agent_id":"child-1", "tokens": 999, "window": 1000}),
+            "context",
+            &json!({"agent_id":"child-1", "tokens_used": 999, "context_limit": 1000}),
         );
         assert!(matches!(
             &child[..],
@@ -1213,7 +1254,7 @@ mod tests {
                     && matches!(event.as_ref(), AgentEvent::ContextUsage { tokens: Some(999), window: Some(1000) })
         ));
         assert_eq!(
-            mapper.map("context_usage", &json!({"tokens": 40, "window": 80})),
+            mapper.map("context", &json!({"tokens_used": 40, "context_limit": 80})),
             vec![AgentEvent::ContextUsage {
                 tokens: Some(40),
                 window: Some(80),
