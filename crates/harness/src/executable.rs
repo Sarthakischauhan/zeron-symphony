@@ -19,10 +19,6 @@ impl Platform {
     }
 }
 
-pub(crate) fn home_dir() -> Option<PathBuf> {
-    home_dir_with(&|key| std::env::var_os(key), Platform::current())
-}
-
 /// Resolve a portable user base directory without assuming Unix's `/` exists.
 pub(crate) fn home_or_current_dir() -> PathBuf {
     home_or_current_dir_with(
@@ -96,16 +92,6 @@ pub(crate) fn find_on_paths(exe: &str, extra: Vec<PathBuf>) -> Option<PathBuf> {
     newest_candidate(candidates)
 }
 
-pub(crate) fn binary_hint(path: &Path) -> String {
-    format!(
-        "{} (version {})",
-        path.display(),
-        binary_version(path)
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "unknown".into())
-    )
-}
-
 fn runnable(path: &Path) -> bool {
     #[cfg(unix)]
     {
@@ -151,6 +137,7 @@ static VERSION_CACHE: std::sync::OnceLock<
 
 /// An explicit install may replace wrappers without changing their metadata.
 /// Clear all candidates, including canonical paths behind vendor symlinks.
+#[cfg(test)]
 pub(crate) fn invalidate_versions(names: &[&str]) {
     if let Some(cache) = VERSION_CACHE.get() {
         cache
@@ -483,6 +470,7 @@ fn is_runnable_candidate(path: &Path, platform: Platform) -> bool {
     path.is_file()
 }
 
+#[cfg(test)]
 pub(crate) fn find_on_paths_with(
     exe: &str,
     extra: Vec<PathBuf>,

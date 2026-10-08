@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Render the dmg background from the landing page's ascii-hand recipe.
 
-Reuses the exact ingredients of apps/landing/public/index.html — the two
+Preserves the upstream landing artwork recipe — the two
 hand density maps, the glyph ramp, the drifting noise field, purple on
 near-black — but frozen at one instant and composed for the 660x400 pt
 drag-to-Applications window (app icon at x=165, Applications at x=495,

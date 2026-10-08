@@ -1,23 +1,5 @@
-//! Sign-ins the engine drives itself for agents that keep one login per
-//! model provider (OpenCode, Pi) — the same flows those agents run in their
-//! own `/login`, with the result written in their own entry format.
-//!
-//! - **ChatGPT** (OpenCode `openai`, Pi `openai-codex`): OpenAI's PKCE
-//!   authorization-code flow with the Codex CLI's public client, redirecting
-//!   to `http://localhost:1455/auth/callback` — the port is FIXED by the
-//!   client registration, so this flow, `codex login` and the agents' own
-//!   logins can't overlap (a new one supersedes any of ours holding it).
-//!   Each login is a fresh grant: a refresh token is never shared with the
-//!   Codex slots (OpenAI rotates them, so sharing one logs the other out).
-//!   The callback port is reported, so a remote login tunnels it.
-//! - **GitHub Copilot** (OpenCode `github-copilot`): GitHub's device flow
-//!   with OpenCode's OAuth app (scope `read:user`) — the dialog shows the
-//!   code; no loopback, so a remote login needs no tunnel. OpenCode stores
-//!   the GitHub token as both `access` and `refresh` with `expires: 0`.
-//!   Pi's Copilot login exchanges the token for an internal Copilot session
-//!   and is left to pi's own `/login`.
+//! Native Symphony ChatGPT authorization through a PKCE loopback callback.
 
-use super::stores::{Upstream, openai_detected, upstream_of};
 use super::*;
 
 /// OpenAI's OAuth issuer (`/oauth/authorize`, `/oauth/token`).
@@ -27,22 +9,18 @@ const OPENAI_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 /// Fixed by the client's registered redirect.
 pub(super) const OPENAI_LOOPBACK_PORT: u16 = 1455;
 const OPENAI_SCOPES: &str = "openid profile email offline_access";
-/// OpenCode's GitHub OAuth app (its Copilot device flow).
-const OPENCODE_COPILOT_CLIENT_ID: &str = "Ov23li8tweQw6odWQebz";
+
 /// How long a sign-in waits on the browser before giving up.
 const LOGIN_WAIT: Duration = Duration::from_secs(10 * 60);
 
 impl AgentAccounts {
-    /// ChatGPT for OpenCode / Pi: PKCE against our own loopback on 1455.
+    /// Symphony ChatGPT sign-in uses PKCE against our loopback on port 1455.
     pub(super) async fn start_openai_login(
         &self,
         harness: HarnessId,
         store_key: &'static str,
     ) -> Result<AgentLoginStart, EngineError> {
-        debug_assert!(
-            harness == HarnessId::Symphony
-                || upstream_of(harness, store_key) == Some(Upstream::OpenAi)
-        );
+        debug_assert_eq!(harness, HarnessId::Symphony);
         self.reap_spawned_flows(harness);
         let wanted = self.inner.endpoints.openai_port;
         self.reap_port_flows(OPENAI_LOOPBACK_PORT);
@@ -64,11 +42,7 @@ impl AgentAccounts {
         let (verifier, challenge) = pkce_pair();
         let state = random_url_token();
         let redirect = format!("http://localhost:{port}/auth/callback");
-        let originator = match harness {
-            HarnessId::Pi => "pi",
-            HarnessId::Symphony => "symphony",
-            _ => "opencode",
-        };
+        let originator = "symphony";
         let url = format!(
             "{}/oauth/authorize?response_type=code&client_id={OPENAI_CLIENT_ID}\
              &redirect_uri={}&scope={}&code_challenge={challenge}\
@@ -102,7 +76,6 @@ impl AgentAccounts {
                 started_at: Instant::now(),
                 state: task_state,
                 handle,
-                home: None,
                 port: Some(OPENAI_LOOPBACK_PORT),
             },
         );
@@ -244,159 +217,9 @@ impl AgentAccounts {
             })?;
             return self.save_new_login(harness, &detected).await;
         }
-        let detected =
-            openai_detected(store_key, &entry, id_token.as_deref()).ok_or_else(|| {
-                EngineError::Other("Could not identify the signed-in ChatGPT account.".into())
-            })?;
-        self.save_new_login(harness, &detected).await
-    }
-
-    /// GitHub Copilot for OpenCode: GitHub's device flow. The start asks
-    /// GitHub for the code (the dialog shows it), then a task polls until
-    /// the user approves.
-    pub(super) async fn start_copilot_login(
-        &self,
-        harness: HarnessId,
-    ) -> Result<AgentLoginStart, EngineError> {
-        self.reap_spawned_flows(harness);
-        let login = self
-            .inner
-            .endpoints
-            .github_login
-            .trim_end_matches('/')
-            .to_string();
-        let device: serde_json::Value = self
-            .inner
-            .http
-            .post(format!("{login}/login/device/code"))
-            .header("Accept", "application/json")
-            .header("User-Agent", "zeron")
-            .form(&[
-                ("client_id", OPENCODE_COPILOT_CLIENT_ID),
-                ("scope", "read:user"),
-            ])
-            .send()
-            .await
-            .map_err(|e| EngineError::Other(format!("Couldn't reach GitHub: {e}")))?
-            .error_for_status()
-            .map_err(|e| EngineError::Other(format!("GitHub refused the sign-in: {e}")))?
-            .json()
-            .await
-            .map_err(|e| EngineError::Other(format!("GitHub returned junk: {e}")))?;
-        let (Some(device_code), Some(user_code), Some(verification)) = (
-            str_field(&device, "device_code"),
-            str_field(&device, "user_code"),
-            str_field(&device, "verification_uri"),
-        ) else {
-            return Err(EngineError::Other(
-                "GitHub didn't return a sign-in code — try again.".into(),
-            ));
-        };
-        let interval = device.get("interval").and_then(|v| v.as_u64()).unwrap_or(5);
-        let login_id = new_id();
-        let state = Arc::new(Mutex::new(TaskLoginState {
-            url: Some(verification.clone()),
-            message: Some(format!("Enter the code {user_code} on GitHub.")),
-            ..Default::default()
-        }));
-        let this = self.clone();
-        let task_state = state.clone();
-        let handle = tokio::spawn(async move {
-            let outcome = tokio::time::timeout(
-                LOGIN_WAIT,
-                this.finish_copilot_login(harness, &login, &device_code, interval),
-            )
-            .await
-            .unwrap_or_else(|_| Err(EngineError::Other("The sign-in timed out.".into())));
-            lock(&task_state).outcome = Some(outcome.map_err(|e| e.to_string()));
-        });
-        lock(&self.inner.flows).insert(
-            login_id.clone(),
-            LoginFlow::Task {
-                harness,
-                started_at: Instant::now(),
-                state,
-                handle,
-                home: None,
-                port: None,
-            },
-        );
-        Ok(AgentLoginStart {
-            login_id,
-            url: verification,
-            mode: AgentLoginMode::Browser,
-            callback_port: None,
-        })
-    }
-
-    async fn finish_copilot_login(
-        &self,
-        harness: HarnessId,
-        login: &str,
-        device_code: &str,
-        interval: u64,
-    ) -> Result<(), EngineError> {
-        let mut interval = interval.max(1);
-        let token = loop {
-            tokio::time::sleep(Duration::from_secs(interval)).await;
-            let reply: serde_json::Value = match self
-                .inner
-                .http
-                .post(format!("{login}/login/oauth/access_token"))
-                .header("Accept", "application/json")
-                .header("User-Agent", "zeron")
-                .form(&[
-                    ("client_id", OPENCODE_COPILOT_CLIENT_ID),
-                    ("device_code", device_code),
-                    ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-                ])
-                .send()
-                .await
-            {
-                Ok(response) => match response.json().await {
-                    Ok(reply) => reply,
-                    Err(_) => continue,
-                },
-                // A blip while the user types the code: keep polling.
-                Err(_) => continue,
-            };
-            if let Some(token) = str_field(&reply, "access_token") {
-                break token;
-            }
-            match str_field(&reply, "error").as_deref() {
-                Some("authorization_pending") | None => {}
-                Some("slow_down") => interval += 5,
-                Some("expired_token") => {
-                    return Err(EngineError::Other(
-                        "The GitHub code expired — start again.".into(),
-                    ));
-                }
-                Some("access_denied") => {
-                    return Err(EngineError::Other(
-                        "The sign-in was declined on GitHub.".into(),
-                    ));
-                }
-                Some(other) => {
-                    return Err(EngineError::Other(format!(
-                        "GitHub sign-in failed: {other}"
-                    )));
-                }
-            }
-        };
-        let entry = serde_json::json!({
-            "type": "oauth",
-            "refresh": token,
-            "access": token,
-            "expires": 0,
-        });
-        let (account_key, profile) = self
-            .github_identity("github-copilot", &token, &entry)
-            .await
-            .ok_or_else(|| {
-                EngineError::Other("Could not identify the signed-in GitHub account.".into())
-            })?;
-        let detected = Detected::known(account_key, profile, entry).keyed("github-copilot");
-        self.save_new_login(harness, &detected).await
+        Err(EngineError::Other(
+            "Only Symphony sign-in is supported.".into(),
+        ))
     }
 }
 

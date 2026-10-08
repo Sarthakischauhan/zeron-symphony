@@ -199,7 +199,6 @@ impl AgentAccounts {
                 started_at: Instant::now(),
                 state,
                 handle,
-                home: None,
                 port: None,
             },
         );
@@ -555,7 +554,6 @@ mod tests {
                 symphony_xai_device: format!("{base}/xai/device"),
                 symphony_xai_token: format!("{base}/xai/token"),
                 claude_profile: format!("{base}/anthropic/profile"),
-                allow_slot_refresh: false,
                 ..Default::default()
             },
             Default::default(),

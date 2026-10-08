@@ -75,15 +75,14 @@ jobs:
       - name: Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
-      - name: OpenCode protocol and permission regressions
+      - name: Symphony protocol and permission regressions
         run: |
-          cargo test --locked -p zeron-harness --lib opencode::
-          cargo test --locked -p zeron-harness --test opencode
+          cargo test --locked -p zeron-harness --lib
       - name: Durable session publication and recovery
         run: |
           cargo test --locked -p zeron-sync --lib
           cargo test --locked -p zeron-update --lib
-          cargo test --locked -p zeron-engine --lib --test session_publication --test restart_resume --test codex_subagents --test local_profiles
+          cargo test --locked -p zeron-engine --lib --test restart_resume --test local_profiles --test symphony_accounts --test symphony_accounts_rpc
 
   ui-tests:
     runs-on: ubuntu-24.04

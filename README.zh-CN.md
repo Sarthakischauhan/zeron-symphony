@@ -1,25 +1,14 @@
 # Zeron Symphony
 
-Zeron 的桌面界面，使用 [Symphony 编码 Agent](https://github.com/Sarthakischauhan/symphony) 作为运行引擎。Zeron 提供工作区、聊天和 Agent 界面；Symphony 负责运行模型和工具。
+基于 Rust/GPUI 的原生桌面工作区，使用 [Symphony](https://github.com/Sarthakischauhan/symphony) 作为唯一生产运行时。Zeron 提供聊天界面、终端、浏览器、差异查看和可选设备同步；Symphony 管理模型、工具、技能、插件、审批和会话检查点。
 
-*[English](README.md) | 简体中文*
+## 从源码运行
 
-![Zeron 桌面截图，展示正在进行的编码会话](apps/landing/public/assets/app-screenshot.jpg)
-
-## 从源码安装
-
-需要 Python 3.11+、[uv](https://docs.astral.sh/uv/) 和稳定版 Rust 工具链。启动 Zeron 前，请先在 Symphony 中配置至少一个模型提供商。
-
-将两个功能分支克隆到同一目录下：
+需要 Python 3.11+、uv、稳定版 Rust 和平台对应的 GPUI 编译依赖。
 
 ```bash
-git clone --branch feat/symphony-provider https://github.com/Sarthakischauhan/zeron-symphony.git
-git clone --branch feat/zeron-stdio-agent https://github.com/Sarthakischauhan/symphony.git
-```
-
-安装 Symphony 并构建 Zeron：
-
-```bash
+git clone https://github.com/Sarthakischauhan/zeron-symphony.git
+git clone https://github.com/Sarthakischauhan/symphony.git
 cd symphony
 uv sync --all-packages
 cd ../zeron-symphony
@@ -28,10 +17,10 @@ cargo build --release --locked -p zeron
 ./target/release/zeron
 ```
 
-请在启动 Zeron 的环境中设置模型提供商凭据。例如，Symphony 支持 `OPENAI_API_KEY`。更多配置、模型发现和当前集成限制，请参阅 [Symphony 安装指南](docs/symphony.md)。
+Symphony 必须支持第 2 版 stdio 协议。模型提供商可通过启动环境或设置中的 Symphony 账户配置。远程引擎所在设备也必须安装 Symphony。
 
-Linux 需要安装 GPUI 的系统构建依赖。应用内浏览器还需要 [WebKitGTK 4.1 和 JSON-GLib](docs/reference/linux-browser.md)。
+详见 [集成指南](docs/symphony.md)、[架构](ARCHITECTURE.md)及[文档索引](docs/README.md)。
 
-## 许可证
+## 许可
 
-[MIT](LICENSE)
+[MIT](LICENSE)。

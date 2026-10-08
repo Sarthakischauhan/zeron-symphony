@@ -9,37 +9,6 @@ use zeron_proto::{HarnessId, invocation::Skill};
 
 const MAX_DISCOVERY_ENTRIES: usize = 4096;
 
-/// Commands and skill metadata both need the provider's advertised catalog.
-/// Share an overlapping probe, but refresh on a later open so provider account,
-/// plugin and workspace changes are not hidden behind a persistent host cache.
-#[derive(Default)]
-pub(crate) struct CommandDiscovery {
-    latest:
-        tokio::sync::Mutex<Option<(PathBuf, std::time::Instant, Vec<zeron_proto::SlashCommand>)>>,
-}
-
-impl CommandDiscovery {
-    pub(crate) async fn get(
-        &self,
-        cwd: &Path,
-        discover: impl std::future::Future<
-            Output = Result<Vec<zeron_proto::SlashCommand>, HarnessError>,
-        >,
-    ) -> Result<Vec<zeron_proto::SlashCommand>, HarnessError> {
-        let requested = std::time::Instant::now();
-        let mut latest = self.latest.lock().await;
-        if let Some((root, completed, commands)) = latest.as_ref()
-            && root == cwd
-            && *completed >= requested
-        {
-            return Ok(commands.clone());
-        }
-        let commands = discover.await?;
-        *latest = Some((cwd.to_owned(), std::time::Instant::now(), commands.clone()));
-        Ok(commands)
-    }
-}
-
 fn symphony_home() -> Option<PathBuf> {
     let executable = std::env::var_os("SYMPHONY_EXECUTABLE")
         .and_then(|path| crate::executable::validate_native_override(Path::new(&path)).ok())
@@ -74,63 +43,6 @@ pub(crate) async fn discover(harness: HarnessId, cwd: &Path) -> Result<Vec<Skill
         .map_err(|error| HarnessError::Protocol(error.to_string()))?
 }
 
-/// Shared Agent Skills do not establish a provider-native command identity.
-pub(crate) fn is_shared_skill(path: &str) -> bool {
-    Path::new(path).ancestors().any(|dir| {
-        dir.file_name().is_some_and(|name| name == "skills")
-            && dir
-                .parent()
-                .and_then(Path::file_name)
-                .is_some_and(|name| name == ".agents")
-    })
-}
-
-/// ACP has no standard skill catalog. Pi labels its skill commands explicitly;
-/// other agents can bind a discovered skill only to a command they advertised.
-pub(crate) fn attach_advertised_commands(
-    harness: HarnessId,
-    skills: &mut Vec<Skill>,
-    commands: &[zeron_proto::SlashCommand],
-) {
-    use zeron_proto::invocation::SkillCommand;
-    for command in commands {
-        if !zeron_proto::invocation::valid_skill_command_name(&command.name) {
-            continue;
-        }
-        let name = if harness == HarnessId::Pi {
-            let Some(name) = command.name.strip_prefix("skill:") else {
-                continue;
-            };
-            name
-        } else {
-            command.name.as_str()
-        };
-        if let Some(skill) = skills.iter_mut().find(|skill| skill.name == name) {
-            // A shared skill named `compact` is not evidence that the
-            // provider's built-in /compact invokes that file. Pi's explicit
-            // skill: namespace supplies the classification other ACP catalogs lack.
-            if harness != HarnessId::Pi && is_shared_skill(&skill.path) {
-                continue;
-            }
-            skill.command = Some(SkillCommand {
-                name: command.name.clone(),
-                harness,
-            });
-        } else if harness == HarnessId::Pi && !name.is_empty() {
-            skills.push(Skill {
-                name: name.into(),
-                path: format!("harness-skill:pi:{name}"),
-                description: command.description.clone(),
-                enabled: true,
-                command: Some(SkillCommand {
-                    name: command.name.clone(),
-                    harness,
-                }),
-            });
-        }
-    }
-}
-
 fn project_dirs(harness: HarnessId) -> &'static [&'static str] {
     match harness {
         HarnessId::ClaudeCode => &[".agents/skills", ".claude/commands", ".claude/skills"],
@@ -158,13 +70,6 @@ fn discover_at(harness: HarnessId, cwd: &Path, home: &Path) -> Result<Vec<Skill>
         .map(|dir| (home.join(dir), String::new()))
         .collect();
     match harness {
-        HarnessId::Antigravity => {
-            roots.extend(
-                crate::acp::antigravity_skill_dirs()
-                    .into_iter()
-                    .map(|path| (path, String::new())),
-            );
-        }
         HarnessId::Pi => roots.push((
             std::env::var_os("PI_CODING_AGENT_DIR")
                 .map(PathBuf::from)
@@ -426,51 +331,6 @@ fn read_skill(path: &Path) -> Result<Option<Skill>, HarnessError> {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn command_discovery_shares_overlap_but_refreshes_later_and_other_roots() {
-        let discovery = CommandDiscovery::default();
-        let probes = std::cell::Cell::new(0);
-        let probe = || async {
-            probes.set(probes.get() + 1);
-            tokio::task::yield_now().await;
-            Ok(vec![zeron_proto::SlashCommand {
-                options: vec![],
-                name: format!("probe-{}", probes.get()),
-                description: String::new(),
-                input_hint: None,
-            }])
-        };
-        let root = Path::new("/workspace");
-        let (commands, skills) =
-            tokio::join!(discovery.get(root, probe()), discovery.get(root, probe()),);
-        assert_eq!(commands.unwrap()[0].name, skills.unwrap()[0].name);
-        assert_eq!(
-            probes.get(),
-            1,
-            "overlapping callers share one provider process"
-        );
-        assert_eq!(
-            discovery.get(root, probe()).await.unwrap()[0].name,
-            "probe-2"
-        );
-        let (a, b) = tokio::join!(
-            discovery.get(root, probe()),
-            discovery.get(Path::new("/other-workspace"), probe()),
-        );
-        assert_ne!(a.unwrap()[0].name, b.unwrap()[0].name);
-        assert_eq!(probes.get(), 4);
-        assert!(
-            discovery
-                .get(root, async { Err(HarnessError::Protocol("retry".into())) })
-                .await
-                .is_err()
-        );
-        assert_eq!(
-            discovery.get(root, probe()).await.unwrap()[0].name,
-            "probe-5"
-        );
-    }
-
     fn write(root: &Path, relative: &str, body: &str) -> PathBuf {
         let path = root.join(relative);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -547,120 +407,6 @@ mod tests {
             found.keys().map(String::as_str).collect::<Vec<_>>(),
             ["linked", "valid"]
         );
-    }
-
-    #[test]
-    fn acp_native_skill_commands_remain_distinct_from_builtin_commands() {
-        let commands = vec![
-            zeron_proto::SlashCommand {
-                options: vec![],
-                name: "skill:review".into(),
-                description: "Review".into(),
-                input_hint: None,
-            },
-            zeron_proto::SlashCommand {
-                options: vec![],
-                name: "compact".into(),
-                description: String::new(),
-                input_hint: None,
-            },
-        ];
-        let mut skills = vec![];
-        attach_advertised_commands(HarnessId::Pi, &mut skills, &commands);
-        assert_eq!(skills.len(), 1);
-        let skill = &skills[0];
-        let invocation = zeron_proto::invocation::Invocation::Skill {
-            name: skill.name.clone(),
-            path: skill.path.clone(),
-            command: skill.command.clone(),
-        };
-        assert_eq!(
-            zeron_proto::invocation::harness_prompt(
-                &format!("{} arguments", invocation.link()),
-                HarnessId::Pi
-            ),
-            "/skill:review arguments"
-        );
-        for harness in [HarnessId::Devin, HarnessId::Grok, HarnessId::Hermes] {
-            let mut skills = vec![Skill {
-                name: "review".into(),
-                path: "/repo/SKILL.md".into(),
-                description: String::new(),
-                enabled: true,
-                command: None,
-            }];
-            let command = zeron_proto::SlashCommand {
-                options: vec![],
-                name: "review".into(),
-                description: String::new(),
-                input_hint: None,
-            };
-            attach_advertised_commands(harness, &mut skills, &[command]);
-            assert_eq!(skills[0].command.as_ref().unwrap().harness, harness);
-        }
-    }
-
-    #[test]
-    fn shared_acp_skills_do_not_alias_builtin_commands() {
-        for harness in [
-            HarnessId::Devin,
-            HarnessId::Grok,
-            HarnessId::Hermes,
-            HarnessId::Antigravity,
-            HarnessId::Pi,
-        ] {
-            let mut skills = vec![Skill {
-                name: "compact".into(),
-                path: "/repo/.agents/skills/compact/SKILL.md".into(),
-                description: "Compact JSON fixtures".into(),
-                enabled: true,
-                command: None,
-            }];
-            let command = |name: &str| zeron_proto::SlashCommand {
-                options: vec![],
-                name: name.into(),
-                description: String::new(),
-                input_hint: None,
-            };
-            attach_advertised_commands(harness, &mut skills, &[command("compact")]);
-            assert!(skills[0].command.is_none(), "{harness:?}");
-            if harness == HarnessId::Pi {
-                attach_advertised_commands(harness, &mut skills, &[command("skill:compact")]);
-                assert_eq!(skills[0].command.as_ref().unwrap().name, "skill:compact");
-            }
-        }
-    }
-
-    #[test]
-    fn advertised_commands_preserve_valid_skill_links() {
-        use zeron_proto::invocation::{Invocation, invocation_links};
-        let commands = [
-            "skill:",
-            "skill:two words",
-            "skill:bad\nname",
-            "skill:bad\0name",
-            "skill:review[ui]",
-            "skill:审查-é:ui.v2_test",
-        ]
-        .into_iter()
-        .map(|name| zeron_proto::SlashCommand {
-            options: vec![],
-            name: name.into(),
-            description: String::new(),
-            input_hint: None,
-        })
-        .collect::<Vec<_>>();
-        let mut skills = vec![];
-        attach_advertised_commands(HarnessId::Pi, &mut skills, &commands);
-        assert_eq!(skills.len(), 1);
-        assert_eq!(skills[0].name, "审查-é:ui.v2_test");
-        let skill = skills.pop().unwrap();
-        let invocation = Invocation::Skill {
-            name: skill.name,
-            path: skill.path,
-            command: skill.command,
-        };
-        assert_eq!(invocation_links(&invocation.link())[0].1, invocation);
     }
 
     #[test]

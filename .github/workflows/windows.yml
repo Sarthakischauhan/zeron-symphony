@@ -61,7 +61,7 @@ jobs:
           cache-on-failure: true
           cache-workspace-crates: true
       - name: Native harness security and integration tests
-        run: cargo test --release --locked -p zeron-harness --features native-fixture --lib --test codex_availability --test windows_native
+        run: cargo test --release --locked -p zeron-harness --lib
       - name: UI tests
         env:
           RUST_BACKTRACE: '1'
@@ -86,7 +86,7 @@ jobs:
       - name: Engine unit tests
         run: cargo test --release --locked -p zeron-engine --lib
       - name: Harness catalog and login tests
-        run: cargo test --release --locked -p zeron-engine --test codex_catalog --test codex_login_resolution
+        run: cargo test --release --locked -p zeron-engine --test symphony_accounts --test symphony_accounts_rpc
       - name: Auth integration tests
         run: cargo test --release --locked -p zeron-engine --test auth
       - name: GUI subsystem and redirected CLI output
