@@ -8501,17 +8501,22 @@ impl Shell {
             };
             rank(&left.label).cmp(&rank(&right.label))
         });
-        let provider_name: SharedString = account
+        let (mark, tint) = account
             .provider
             .as_deref()
-            .map(crate::account_usage::provider_label)
-            .unwrap_or_else(|| crate::settings::accounts::provider_name(account.harness).to_string())
-            .into();
-        let name: SharedString = account
+            .map(|provider| {
+                crate::pickers::model_brand_icon(
+                    account.harness,
+                    &format!("{provider}:account"),
+                )
+            })
+            .unwrap_or_else(|| crate::pickers::harness_brand_icon(account.harness));
+        let email: SharedString = account
             .email
             .clone()
-            .or_else(|| account.display_name.clone())
-            .unwrap_or_else(|| "Unknown account".into())
+            .filter(|email| email.contains('@'))
+            .or_else(|| account.display_name.clone().filter(|name| name.contains('@')))
+            .unwrap_or_else(|| "No email".into())
             .into();
         Some(
             div()
@@ -8526,6 +8531,19 @@ impl Shell {
                 .gap(px(10.0))
                 .child(
                     div()
+                        .flex_none()
+                        .size(px(22.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            icon(mark)
+                                .size(px(16.0))
+                                .text_color(tint.unwrap_or(theme.text)),
+                        ),
+                )
+                .child(
+                    div()
                         .flex_1()
                         .min_w_0()
                         .flex()
@@ -8533,19 +8551,11 @@ impl Shell {
                         .child(
                             div()
                                 .truncate()
-                                .text_size(px(10.5))
-                                .line_height(px(14.0))
-                                .text_color(theme.text_muted)
-                                .child(provider_name),
-                        )
-                        .child(
-                            div()
-                                .truncate()
-                                .text_size(px(13.0))
-                                .line_height(px(18.0))
+                                .text_size(px(12.5))
+                                .line_height(px(17.0))
                                 .font_weight(gpui::FontWeight::MEDIUM)
                                 .text_color(theme.text)
-                                .child(name),
+                                .child(email),
                         )
                         .when(account.active, |column| {
                             column.child(

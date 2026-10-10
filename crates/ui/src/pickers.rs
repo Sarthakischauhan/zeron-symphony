@@ -884,7 +884,7 @@ impl Pickers {
     }
 
     /// Effective harness: picked, or the chat's config, or the first listed.
-    fn effective_harness(&self, cx: &App) -> Option<HarnessId> {
+    pub(crate) fn effective_harness(&self, cx: &App) -> Option<HarnessId> {
         if let Some(harness) = self.config.harness {
             return Some(harness);
         }
@@ -965,7 +965,7 @@ impl Pickers {
 
     /// Only an implicit selection follows the harness default. An explicit ID
     /// absent from the live catalog keeps its identity and remembered chip label.
-    fn selected_model<'a>(&'a self, cx: &'a App) -> Option<&'a Model> {
+    pub(crate) fn selected_model<'a>(&'a self, cx: &'a App) -> Option<&'a Model> {
         let harness = self.effective_harness(cx)?;
         let models = self.models.get(&harness)?.ready()?;
         let selected = self.effective_model_id(cx);
@@ -2055,6 +2055,8 @@ impl Pickers {
                             ),
                             reasoning_levels: vec![],
                             options: vec![],
+                            context_limit: None,
+                            provider: None,
                         },
                     },
                 );
@@ -5153,7 +5155,10 @@ pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gp
 /// Symphony mark for the harness rail, but show the model's provider in rows
 /// and the selected chip. Gateways and unknown providers retain the harness
 /// mark: an upstream model name does not identify the API provider.
-fn model_brand_icon(harness: HarnessId, model_id: &str) -> (&'static str, Option<gpui::Hsla>) {
+pub(crate) fn model_brand_icon(
+    harness: HarnessId,
+    model_id: &str,
+) -> (&'static str, Option<gpui::Hsla>) {
     if harness == HarnessId::Symphony {
         match model_id.split_once(':').map(|(provider, _)| provider) {
             Some("openai") => return (crate::icons::OPENAI_MARK, None),
@@ -6427,6 +6432,8 @@ mod tests {
             description: None,
             reasoning_levels: Vec::new(),
             options: Vec::new(),
+            context_limit: None,
+            provider: None,
         }
     }
 
@@ -7607,6 +7614,8 @@ mod tests {
                 description: None,
                 reasoning_levels: vec![],
                 options: vec![],
+                context_limit: None,
+                provider: None,
             },
             Model {
                 id: "fast".into(),
@@ -7614,6 +7623,8 @@ mod tests {
                 description: None,
                 reasoning_levels: vec![],
                 options: vec![],
+                context_limit: None,
+                provider: None,
             },
         ];
         assert_eq!(default_model(&models).map(|m| &*m.id), Some("flagship"));
