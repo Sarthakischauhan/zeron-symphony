@@ -546,7 +546,24 @@ mod symphony_registry_tests {
         let registry = symphony_registry();
         assert_eq!(registry.descriptors().len(), 1);
         assert_eq!(registry.descriptors()[0].id, HarnessId::Symphony);
-        assert!(registry.resolve(HarnessId::ClaudeCode).is_err());
+        for id in [
+            HarnessId::ClaudeCode,
+            HarnessId::Codex,
+            HarnessId::Cursor,
+            HarnessId::Devin,
+            HarnessId::Grok,
+            HarnessId::Hermes,
+            HarnessId::Pi,
+            HarnessId::Opencode,
+            HarnessId::Antigravity,
+        ] {
+            assert!(
+                registry.resolve(id).is_err(),
+                "legacy runtime {id:?} resolved"
+            );
+            assert!(default_registry().resolve(id).is_err());
+            assert!(!zeron_harness::install::can_install(id));
+        }
     }
 }
 
@@ -567,12 +584,10 @@ fn register_symphony(registry: &HarnessRegistry) {
     );
 }
 
-/// The production registry: MockHarness (hidden from production pickers) plus a lazy
-/// `claude-code` slot resolved through `zeron_harness` on first use (subprocess
-/// discovery only happens when a run/model call actually needs it).
+/// Symphony plus the scripted mock used by engine tests and demos.
 pub fn default_registry() -> HarnessRegistry {
     // Warm the login-shell PATH snapshot in the background so the first
-    // claude/codex resolve doesn't pay the shell-startup latency inline.
+    // Symphony resolve doesn't pay the shell-startup latency inline.
     zeron_harness::shell_env::prewarm();
     let registry = HarnessRegistry::new();
     register_symphony(&registry);
@@ -620,198 +635,6 @@ pub fn default_registry() -> HarnessRegistry {
             },
         ],
     }));
-    registry.register_lazy(
-        HarnessDescriptor {
-            id: HarnessId::ClaudeCode,
-            name: "Claude Code".into(),
-            supports_steering: true,
-            steering_mode: SteeringMode::StepBoundary,
-            // Must mirror ClaudeHarness exactly — the descriptor-stability
-            // rule (see the codex test below).
-            reasoning_levels: vec![
-                ReasoningLevel::Low,
-                ReasoningLevel::Medium,
-                ReasoningLevel::High,
-                ReasoningLevel::XHigh,
-                ReasoningLevel::Max,
-            ],
-            installed: true,
-            can_install: false,
-            enabled: None,
-        },
-        Box::new(|| zeron_harness::ClaudeHarness::new().installed()),
-        Box::new(|| Ok(Arc::new(zeron_harness::ClaudeHarness::new()) as Arc<dyn Harness>)),
-    );
-    // Codex, same lazy pattern: the static descriptor mirrors AcpHarness::codex()
-    // exactly (`describe()` after the first resolve must not change the
-    // catalog entry) — "Codex" per the original HARNESS_LABEL, StepBoundary
-    // steering via native `turn/steer`, and the unified reasoning ladder from
-    // zeron_harness::codex::catalog. CLI discovery only happens when a
-    // run/model call actually resolves the slot.
-    registry.register_lazy(
-        HarnessDescriptor {
-            id: HarnessId::Codex,
-            name: "Codex".into(),
-            supports_steering: true,
-            steering_mode: SteeringMode::StepBoundary,
-            reasoning_levels: vec![
-                ReasoningLevel::Minimal,
-                ReasoningLevel::Low,
-                ReasoningLevel::Medium,
-                ReasoningLevel::High,
-                ReasoningLevel::XHigh,
-                ReasoningLevel::Max,
-                ReasoningLevel::Ultra,
-            ],
-            installed: true,
-            can_install: false,
-            enabled: None,
-        },
-        Box::new(|| zeron_harness::CodexHarness::new().installed()),
-        Box::new(|| Ok(Arc::new(zeron_harness::CodexHarness::new()) as Arc<dyn Harness>)),
-    );
-    // Cursor via the pinned @cursor/sdk shim (NOT ACP — that surface strips
-    // subagent transcripts), same lazy pattern: the static descriptor mirrors
-    // CursorHarness exactly. Native step-boundary steering; no effort ladder.
-    registry.register_lazy(
-        HarnessDescriptor {
-            id: HarnessId::Cursor,
-            name: "Cursor".into(),
-            supports_steering: true,
-            steering_mode: SteeringMode::StepBoundary,
-            reasoning_levels: Vec::new(),
-            installed: true,
-            can_install: false,
-            enabled: None,
-        },
-        Box::new(|| zeron_harness::CursorHarness::new().installed()),
-        Box::new(|| Ok(Arc::new(zeron_harness::CursorHarness::new()) as Arc<dyn Harness>)),
-    );
-    // Devin over ACP (`devin acp`), same lazy pattern: the static descriptor
-    // mirrors AcpHarness::devin() exactly. No steering extension (turn
-    // boundaries) and no effort ladder — Devin bakes effort into the
-    // advertised model ids instead of a `thought_level` option.
-    registry.register_lazy(
-        HarnessDescriptor {
-            id: HarnessId::Devin,
-            name: "Devin".into(),
-            supports_steering: true,
-            steering_mode: SteeringMode::TurnBoundary,
-            reasoning_levels: Vec::new(),
-            installed: true,
-            can_install: false,
-            enabled: None,
-        },
-        Box::new(|| zeron_harness::AcpHarness::devin().installed()),
-        Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::devin()) as Arc<dyn Harness>)),
-    );
-    // Grok Build over ACP, same lazy pattern: the static descriptor mirrors
-    // AcpHarness::grok() exactly. No `_session/steering` extension yet, so
-    // steers deliver at turn boundaries; the effort ladder applies per
-    // session via the `thought_level` config option.
-    registry.register_lazy(
-        HarnessDescriptor {
-            id: HarnessId::Grok,
-            name: "Grok".into(),
-            supports_steering: true,
-            steering_mode: SteeringMode::TurnBoundary,
-            reasoning_levels: vec![
-                ReasoningLevel::Low,
-                ReasoningLevel::Medium,
-                ReasoningLevel::High,
-            ],
-            installed: true,
-            can_install: false,
-            enabled: None,
-        },
-        Box::new(|| zeron_harness::AcpHarness::grok().installed()),
-        Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::grok()) as Arc<dyn Harness>)),
-    );
-    // Hermes Agent over ACP (`hermes acp`), same lazy pattern: the static
-    // descriptor mirrors AcpHarness::hermes() exactly. No steering extension
-    // (turn boundaries) and no effort ladder — Hermes exposes no effort
-    // config over ACP today (hybrid reasoning is model-internal).
-    registry.register_lazy(
-        HarnessDescriptor {
-            id: HarnessId::Hermes,
-            name: "Hermes".into(),
-            supports_steering: true,
-            steering_mode: SteeringMode::TurnBoundary,
-            reasoning_levels: Vec::new(),
-            installed: true,
-            can_install: false,
-            enabled: None,
-        },
-        Box::new(|| zeron_harness::AcpHarness::hermes().installed()),
-        Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::hermes()) as Arc<dyn Harness>)),
-    );
-    // pi over ACP (community `pi-acp` adapter), same lazy pattern: the static
-    // descriptor mirrors AcpHarness::pi() exactly — turn-boundary steering,
-    // pi's thinking ladder minus its "off" tier.
-    registry.register_lazy(
-        HarnessDescriptor {
-            id: HarnessId::Pi,
-            name: "Pi".into(),
-            supports_steering: true,
-            steering_mode: SteeringMode::TurnBoundary,
-            reasoning_levels: vec![
-                ReasoningLevel::Minimal,
-                ReasoningLevel::Low,
-                ReasoningLevel::Medium,
-                ReasoningLevel::High,
-                ReasoningLevel::XHigh,
-                ReasoningLevel::Max,
-            ],
-            installed: true,
-            can_install: false,
-            enabled: None,
-        },
-        Box::new(|| zeron_harness::AcpHarness::pi().installed()),
-        Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::pi()) as Arc<dyn Harness>)),
-    );
-    // opencode over its NATIVE HTTP/SSE protocol (the one the opencode
-    // desktop app speaks — `opencode serve` + the /global/event bus), same
-    // lazy pattern: the static descriptor mirrors OpencodeHarness exactly.
-    // Turn-boundary steering; the effort ladder rides model VARIANTS (the
-    // run sends the first advertised variant id for the picked level).
-    registry.register_lazy(
-        HarnessDescriptor {
-            id: HarnessId::Opencode,
-            name: "OpenCode".into(),
-            supports_steering: true,
-            steering_mode: SteeringMode::TurnBoundary,
-            reasoning_levels: vec![
-                ReasoningLevel::Low,
-                ReasoningLevel::Medium,
-                ReasoningLevel::High,
-                ReasoningLevel::XHigh,
-                ReasoningLevel::Max,
-            ],
-            installed: true,
-            can_install: false,
-            enabled: None,
-        },
-        Box::new(|| zeron_harness::OpencodeHarness::new().installed()),
-        Box::new(|| Ok(Arc::new(zeron_harness::OpencodeHarness::new()) as Arc<dyn Harness>)),
-    );
-    // antigravity over acp (google's agy_acp_server), same lazy pattern: the
-    // static descriptor mirrors AcpHarness::antigravity() exactly. No steering
-    // extension (turn boundaries), and effort is baked into the model ids, so
-    // the ladder lives on each model rather than the harness.
-    registry.register_lazy(
-        HarnessDescriptor {
-            id: HarnessId::Antigravity,
-            name: "Antigravity".into(),
-            supports_steering: true,
-            steering_mode: SteeringMode::TurnBoundary,
-            reasoning_levels: Vec::new(),
-            installed: true,
-            can_install: false,
-            enabled: None,
-        },
-        Box::new(|| zeron_harness::AcpHarness::antigravity().installed()),
-        Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::antigravity()) as Arc<dyn Harness>)),
-    );
     registry
 }
 
@@ -876,97 +699,6 @@ mod tests {
         );
         assert!(registry.resolve(HarnessId::Mock).is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn default_registry_lists_mock_claude_codex_and_grok_slots() {
-        let registry = default_registry();
-        let ids: Vec<HarnessId> = registry.descriptors().iter().map(|d| d.id).collect();
-        assert_eq!(
-            ids,
-            vec![
-                HarnessId::Mock,
-                HarnessId::ClaudeCode,
-                HarnessId::Codex,
-                HarnessId::Cursor,
-                HarnessId::Devin,
-                HarnessId::Grok,
-                HarnessId::Hermes,
-                HarnessId::Pi,
-                HarnessId::Opencode,
-                HarnessId::Antigravity
-            ]
-        );
-        assert!(registry.resolve(HarnessId::Mock).is_ok());
-        assert!(registry.resolve(HarnessId::ClaudeCode).is_ok());
-        // A codex-configured chat resolves the right harness (construction is
-        // cheap; CLI discovery is deferred to models()/run()).
-        let codex = registry.resolve(HarnessId::Codex).unwrap();
-        assert_eq!(codex.id(), HarnessId::Codex);
-        // Grok resolves through the shared ACP harness; its descriptor must
-        // mirror the resolved harness (descriptor-stability rule).
-        let grok = registry.resolve(HarnessId::Grok).unwrap();
-        assert_eq!(grok.id(), HarnessId::Grok);
-        assert_eq!(grok.display_name(), "Grok");
-        assert_eq!(grok.steering_mode(), SteeringMode::StepBoundary);
-        assert_eq!(
-            grok.reasoning_levels(),
-            &[
-                ReasoningLevel::Low,
-                ReasoningLevel::Medium,
-                ReasoningLevel::High
-            ]
-        );
-        // Cursor, Devin, Hermes and Pi mirror their specs the same way.
-        let cursor = registry.resolve(HarnessId::Cursor).unwrap();
-        assert_eq!(cursor.id(), HarnessId::Cursor);
-        assert_eq!(cursor.display_name(), "Cursor");
-        assert_eq!(cursor.steering_mode(), SteeringMode::StepBoundary);
-        assert!(cursor.reasoning_levels().is_empty());
-        let devin = registry.resolve(HarnessId::Devin).unwrap();
-        assert_eq!(devin.id(), HarnessId::Devin);
-        assert_eq!(devin.display_name(), "Devin");
-        assert_eq!(devin.steering_mode(), SteeringMode::StepBoundary);
-        assert!(devin.reasoning_levels().is_empty());
-        let hermes = registry.resolve(HarnessId::Hermes).unwrap();
-        assert_eq!(hermes.id(), HarnessId::Hermes);
-        assert_eq!(hermes.display_name(), "Hermes");
-        assert_eq!(hermes.steering_mode(), SteeringMode::TurnBoundary);
-        assert!(hermes.reasoning_levels().is_empty());
-        let opencode = registry.resolve(HarnessId::Opencode).unwrap();
-        assert_eq!(opencode.id(), HarnessId::Opencode);
-        assert_eq!(opencode.display_name(), "OpenCode");
-        assert_eq!(opencode.steering_mode(), SteeringMode::StepBoundary);
-        assert_eq!(
-            opencode.reasoning_levels(),
-            &[
-                ReasoningLevel::Low,
-                ReasoningLevel::Medium,
-                ReasoningLevel::High,
-                ReasoningLevel::XHigh,
-                ReasoningLevel::Max,
-            ]
-        );
-        let antigravity = registry.resolve(HarnessId::Antigravity).unwrap();
-        assert_eq!(antigravity.id(), HarnessId::Antigravity);
-        assert_eq!(antigravity.display_name(), "Antigravity");
-        assert_eq!(antigravity.steering_mode(), SteeringMode::TurnBoundary);
-        assert!(antigravity.reasoning_levels().is_empty());
-        let pi = registry.resolve(HarnessId::Pi).unwrap();
-        assert_eq!(pi.id(), HarnessId::Pi);
-        assert_eq!(pi.display_name(), "Pi");
-        assert_eq!(pi.steering_mode(), SteeringMode::StepBoundary);
-        assert_eq!(
-            pi.reasoning_levels(),
-            &[
-                ReasoningLevel::Minimal,
-                ReasoningLevel::Low,
-                ReasoningLevel::Medium,
-                ReasoningLevel::High,
-                ReasoningLevel::XHigh,
-                ReasoningLevel::Max
-            ]
-        );
     }
 
     /// Catalogs serialized by engines that predate the `installed`/`enabled`
@@ -1149,62 +881,6 @@ mod tests {
         assert_eq!(reloaded.enabled_set(), vec![HarnessId::ClaudeCode]);
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn antigravity_detection_subprocess() {
-        let Ok(expected) = std::env::var("ZERON_TEST_AGY_INSTALLED") else {
-            return;
-        };
-        let registry = HarnessRegistry::new();
-        let data = tempfile::tempdir().unwrap();
-        registry.load_prefs(data.path());
-        registry.register(Arc::new(zeron_harness::AcpHarness::antigravity()));
-        let expected = expected == "true";
-        assert_eq!(registry.descriptors()[0].installed, expected);
-        assert_eq!(
-            registry.enabled_set().contains(&HarnessId::Antigravity),
-            expected
-        );
-        assert_eq!(descriptor_enabled(&registry.descriptors()[0]), expected);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn antigravity_server_path_controls_detection_and_enablement() {
-        use std::os::unix::fs::PermissionsExt;
-        let home = tempfile::tempdir().unwrap();
-        let bin = home.path().join("bin");
-        std::fs::create_dir(&bin).unwrap();
-        let cli = bin.join("agy");
-        std::fs::write(&cli, "#!/bin/sh\nexit 91\n").unwrap();
-        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let server = bin.join("agy_acp_server.par");
-        for installed in [false, true] {
-            if installed {
-                std::fs::write(&server, "#!/bin/sh\nexit 91\n").unwrap();
-                std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
-            }
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "registry::tests::antigravity_detection_subprocess",
-                    "--nocapture",
-                ])
-                .env("HOME", home.path())
-                .env("PATH", &bin)
-                .env_remove("ANTIGRAVITY_ACP_EXECUTABLE")
-                .env("ZERON_NO_LOGIN_SHELL", "1")
-                .env("ZERON_TEST_AGY_INSTALLED", installed.to_string())
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stdout)
-            );
-        }
-    }
-
     /// The mock resolves on every machine, so detection alone would enable it
     /// and let the last REAL agent be switched off — leaving a composer with
     /// nothing runnable behind a guard that thinks it is covered.
@@ -1273,77 +949,11 @@ mod tests {
         reloaded.load_prefs(dir.path());
         assert_eq!(reloaded.enabled_set(), Vec::<HarnessId>::new());
     }
-
-    /// The Codex lazy descriptor must be indistinguishable from `describe()`
-    /// after the first resolve — otherwise the catalog entry silently changes
-    /// the moment the harness is used (name/ladder flip in the picker rail).
-    /// (KNOWN GAP, predates this slot: the claude-code descriptor advertises
-    /// `[Ultrathink]` while the resolved adapter reports `[Low..Max]` — left
-    /// as-is here; flagged for its own pass.)
-    #[test]
-    fn codex_lazy_descriptor_matches_resolved_harness() {
-        let registry = default_registry();
-        let before = registry
-            .descriptors()
-            .into_iter()
-            .find(|d| d.id == HarnessId::Codex)
-            .unwrap();
-        registry.resolve(HarnessId::Codex).unwrap();
-        let after = registry
-            .descriptors()
-            .into_iter()
-            .find(|d| d.id == HarnessId::Codex)
-            .unwrap();
-        assert_eq!(before.name, after.name);
-        assert_eq!(before.supports_steering, after.supports_steering);
-        assert_eq!(before.steering_mode, after.steering_mode);
-        assert_eq!(before.reasoning_levels, after.reasoning_levels);
-    }
 }
 
 #[cfg(test)]
 mod title_tests {
     use super::*;
-
-    #[test]
-    fn title_preferences_persist_and_validate_harness_model_pairs() {
-        let dir = tempfile::tempdir().unwrap();
-        let registry = HarnessRegistry::new();
-        registry.load_prefs(dir.path());
-        registry.register(Arc::new(
-            zeron_harness::ClaudeHarness::new().with_executable(std::env::current_exe().unwrap()),
-        ));
-        let settings = TitleSettings {
-            harness: Some(HarnessId::ClaudeCode),
-            model: Some("haiku-test".into()),
-        };
-        registry.set_title_settings(settings.clone()).unwrap();
-        let reloaded = HarnessRegistry::new();
-        reloaded.load_prefs(dir.path());
-        assert_eq!(reloaded.title_settings(), settings);
-        assert!(
-            registry
-                .set_title_settings(TitleSettings {
-                    harness: None,
-                    model: Some("orphan".into())
-                })
-                .is_err()
-        );
-        assert!(
-            registry
-                .set_title_settings(TitleSettings {
-                    harness: Some(HarnessId::Cursor),
-                    model: None
-                })
-                .is_err()
-        );
-        assert_eq!(registry.title_settings(), settings);
-        registry
-            .set_title_settings(TitleSettings::default())
-            .unwrap();
-        reloaded.load_prefs(dir.path());
-        assert_eq!(reloaded.title_settings(), TitleSettings::default());
-    }
 
     #[test]
     fn old_harness_preferences_default_to_automatic_titles() {

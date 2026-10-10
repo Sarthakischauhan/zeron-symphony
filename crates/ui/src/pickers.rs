@@ -884,7 +884,7 @@ impl Pickers {
     }
 
     /// Effective harness: picked, or the chat's config, or the first listed.
-    fn effective_harness(&self, cx: &App) -> Option<HarnessId> {
+    pub(crate) fn effective_harness(&self, cx: &App) -> Option<HarnessId> {
         if let Some(harness) = self.config.harness {
             return Some(harness);
         }
@@ -965,7 +965,7 @@ impl Pickers {
 
     /// Only an implicit selection follows the harness default. An explicit ID
     /// absent from the live catalog keeps its identity and remembered chip label.
-    fn selected_model<'a>(&'a self, cx: &'a App) -> Option<&'a Model> {
+    pub(crate) fn selected_model<'a>(&'a self, cx: &'a App) -> Option<&'a Model> {
         let harness = self.effective_harness(cx)?;
         let models = self.models.get(&harness)?.ready()?;
         let selected = self.effective_model_id(cx);
@@ -1438,7 +1438,7 @@ impl Pickers {
                         // Display hygiene for catalogs from older engines
                         // (`default` alias rows, orphan `[1m]` variants,
                         // version-less alias labels).
-                        Ok(models) => Loadable::Ready(normalize_model_rows(harness, models)),
+                        Ok(models) => Loadable::Ready(models),
                         Err(err) => Loadable::Error(err.to_string()),
                     },
                     Err(err) => Loadable::Error(err.to_string()),
@@ -2055,6 +2055,8 @@ impl Pickers {
                             ),
                             reasoning_levels: vec![],
                             options: vec![],
+                            context_limit: None,
+                            provider: None,
                         },
                     },
                 );
@@ -5127,92 +5129,6 @@ fn empty_list_note(theme: &Theme, copy: &str) -> AnyElement {
         .into_any_element()
 }
 
-/// Display-side model-list hygiene, mirroring the engine's discovery-side
-/// fold (`models_from_session`) for catalogs served by OLDER engines (the
-/// space's device may run any version): the `default` alias row drops when a
-/// real row exists, an orphan `<model>[1m]` variant presents as its base id
-/// with the Context Window trait pinned to 1M, and Claude rows adopt the
-/// curated catalog's labels so the version number always shows ("Opus 5.5",
-/// not the wire's terse "Opus" alias — user request). Idempotent over
-/// already-clean lists. The send path recomposes the advertised id from the
-/// base + trait (`pick_model_value`), so a folded pick still runs.
-pub(crate) fn normalize_model_rows(harness: HarnessId, models: Vec<Model>) -> Vec<Model> {
-    fn strip_1m(id: &str) -> Option<&str> {
-        id.strip_suffix("[1m]").or_else(|| id.strip_suffix("-1m"))
-    }
-    fn norm(id: &str) -> String {
-        id.chars()
-            .filter(|c| c.is_ascii_alphanumeric())
-            .collect::<String>()
-            .to_ascii_lowercase()
-    }
-    let catalog = match harness {
-        HarnessId::ClaudeCode => zeron_harness::claude::catalog::static_models(),
-        _ => Vec::new(),
-    };
-    // Curated label for an id: exact normalized match, else — for bare
-    // alphabetic aliases like `opus` — the first (flagship-ordered) family
-    // row. Versioned foreign ids never fuzzy-match.
-    let curated_label = |id: &str| -> Option<String> {
-        let id_norm = norm(id);
-        if let Some(row) = catalog.iter().find(|m| norm(&m.id) == id_norm) {
-            return Some(row.label.clone());
-        }
-        (!id_norm.is_empty() && id_norm.chars().all(|c| c.is_ascii_alphabetic()))
-            .then(|| catalog.iter().find(|m| norm(&m.id).contains(&id_norm)))
-            .flatten()
-            .map(|m| m.label.clone())
-    };
-    let ids: Vec<String> = models.iter().map(|m| m.id.clone()).collect();
-    let has_real = ids.iter().any(|id| !id.eq_ignore_ascii_case("default"));
-    models
-        .into_iter()
-        .filter_map(|mut model| {
-            if has_real && model.id.eq_ignore_ascii_case("default") {
-                return None;
-            }
-            if let Some(base) = strip_1m(&model.id.clone()) {
-                if ids.iter().any(|other| other == base) {
-                    // The bare base is listed too — the engine already gave
-                    // it the Context Window trait; the variant row is noise.
-                    return None;
-                }
-                model.id = base.to_string();
-                // "Opus (1M context)" → "Opus".
-                if let Some(at) = model.label.rfind(" (")
-                    && model.label.ends_with(')')
-                {
-                    model.label.truncate(at);
-                    while model.label.ends_with(' ') {
-                        model.label.pop();
-                    }
-                }
-                if !model.options.iter().any(|o| o.id == "contextWindow") {
-                    model.options.push(zeron_proto::ModelOption {
-                        id: "contextWindow".into(),
-                        label: "Context Window".into(),
-                        choices: vec![
-                            zeron_proto::ModelOptionChoice {
-                                id: "200k".into(),
-                                label: "200K".into(),
-                            },
-                            zeron_proto::ModelOptionChoice {
-                                id: "1m".into(),
-                                label: "1M".into(),
-                            },
-                        ],
-                        default_choice: "1m".into(),
-                    });
-                }
-            }
-            if let Some(label) = curated_label(&model.id) {
-                model.label = label;
-            }
-            Some(model)
-        })
-        .collect()
-}
-
 pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gpui::Hsla>) {
     match harness {
         HarnessId::ClaudeCode | HarnessId::Mock => (
@@ -5239,7 +5155,10 @@ pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gp
 /// Symphony mark for the harness rail, but show the model's provider in rows
 /// and the selected chip. Gateways and unknown providers retain the harness
 /// mark: an upstream model name does not identify the API provider.
-fn model_brand_icon(harness: HarnessId, model_id: &str) -> (&'static str, Option<gpui::Hsla>) {
+pub(crate) fn model_brand_icon(
+    harness: HarnessId,
+    model_id: &str,
+) -> (&'static str, Option<gpui::Hsla>) {
     if harness == HarnessId::Symphony {
         match model_id.split_once(':').map(|(provider, _)| provider) {
             Some("openai") => return (crate::icons::OPENAI_MARK, None),
@@ -5612,11 +5531,22 @@ mod tests {
             pickers.update(cx, |pickers, cx| {
                 pickers.config.harness = Some(HarnessId::Symphony);
                 pickers.select_symphony_effort_command("none", cx);
-                assert_eq!(pickers.resolved(cx).model_options["symphonyReasoningEffort"], "none");
+                assert_eq!(
+                    pickers.resolved(cx).model_options["symphonyReasoningEffort"],
+                    "none"
+                );
                 pickers.select_symphony_effort_command("low", cx);
-                assert_eq!(pickers.resolved(cx).model_options["symphonyReasoningEffort"], "low");
+                assert_eq!(
+                    pickers.resolved(cx).model_options["symphonyReasoningEffort"],
+                    "low"
+                );
                 pickers.pick_reasoning(ReasoningLevel::High, cx);
-                assert!(!pickers.resolved(cx).model_options.contains_key("symphonyReasoningEffort"));
+                assert!(
+                    !pickers
+                        .resolved(cx)
+                        .model_options
+                        .contains_key("symphonyReasoningEffort")
+                );
             });
         });
     }
@@ -6502,6 +6432,8 @@ mod tests {
             description: None,
             reasoning_levels: Vec::new(),
             options: Vec::new(),
+            context_limit: None,
+            provider: None,
         }
     }
 
@@ -7536,84 +7468,6 @@ mod tests {
     }
 
     #[test]
-    fn normalize_drops_default_alias_and_folds_orphan_1m_rows() {
-        // The shape an OLDER engine serves: a `default` alias row plus
-        // 1M-pinned variants with no bare base. A non-claude harness keeps
-        // wire labels (no curated catalog to borrow from).
-        let models = normalize_model_rows(
-            HarnessId::Codex,
-            vec![
-                bare_model("default", "Default (recommended)"),
-                bare_model("titan[1m]", "Titan (1M context)"),
-                bare_model("gpt-x-9[1m]", "GPT X-9"),
-                bare_model("nano", "Nano"),
-            ],
-        );
-        assert_eq!(
-            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
-            vec!["titan", "gpt-x-9", "nano"]
-        );
-        assert_eq!(models[0].label, "Titan");
-        assert_eq!(models[1].label, "GPT X-9");
-        // Folded rows pin the Context Window trait to 1M.
-        assert!(
-            models[0]
-                .options
-                .iter()
-                .any(|o| o.id == "contextWindow" && o.default_choice == "1m")
-        );
-        assert!(models[2].options.is_empty());
-
-        // A `default`-only list survives (nothing real to prefer).
-        let only_default =
-            normalize_model_rows(HarnessId::Codex, vec![bare_model("default", "Default")]);
-        assert_eq!(only_default.len(), 1);
-
-        // A base-plus-variant pair (already folded by a NEWER engine — the
-        // variant never reaches us; belt-and-braces if it does): variant
-        // drops, base is untouched.
-        let paired = normalize_model_rows(
-            HarnessId::Codex,
-            vec![
-                bare_model("titan-5", "Titan 5"),
-                bare_model("titan-5[1m]", "Titan 5 (1M)"),
-            ],
-        );
-        assert_eq!(paired.len(), 1);
-        assert_eq!(paired[0].id, "titan-5");
-
-        // Idempotent over a clean list.
-        let clean = vec![bare_model("titan-5", "Titan 5")];
-        assert_eq!(normalize_model_rows(HarnessId::Codex, clean.clone()), clean);
-    }
-
-    #[test]
-    fn normalize_gives_claude_rows_their_versioned_catalog_labels() {
-        // The real prod shape: alias values with terse names. Claude rows
-        // adopt the curated labels so the version number always shows
-        // (user request), exact ids included; foreign ids pass through.
-        let models = normalize_model_rows(
-            HarnessId::ClaudeCode,
-            vec![
-                bare_model("default", "Default (recommended)"),
-                bare_model("opus[1m]", "Opus (1M context)"),
-                bare_model("claude-fable-5[1m]", "Fable"),
-                bare_model("sonnet", "Sonnet"),
-                bare_model("haiku", "Haiku"),
-                bare_model("claude-nova-1", "Nova 1"),
-            ],
-        );
-        assert_eq!(
-            models.iter().map(|m| m.label.as_str()).collect::<Vec<_>>(),
-            vec!["Opus 5.5", "Fable 5", "Sonnet 5", "Haiku 4.5", "Nova 1"]
-        );
-        assert_eq!(
-            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
-            vec!["opus", "claude-fable-5", "sonnet", "haiku", "claude-nova-1"]
-        );
-    }
-
-    #[test]
     fn remembered_picks_keep_only_offered_options() {
         let mut model = bare_model("opus", "Opus");
         model.options = vec![ModelOption {
@@ -7760,6 +7614,8 @@ mod tests {
                 description: None,
                 reasoning_levels: vec![],
                 options: vec![],
+                context_limit: None,
+                provider: None,
             },
             Model {
                 id: "fast".into(),
@@ -7767,6 +7623,8 @@ mod tests {
                 description: None,
                 reasoning_levels: vec![],
                 options: vec![],
+                context_limit: None,
+                provider: None,
             },
         ];
         assert_eq!(default_model(&models).map(|m| &*m.id), Some("flagship"));

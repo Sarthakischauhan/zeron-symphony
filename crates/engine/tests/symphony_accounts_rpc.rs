@@ -172,3 +172,21 @@ async fn symphony_accounts_rpc_lifecycle() {
 fn read_json(path: &std::path::Path) -> Value {
     serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
 }
+
+#[tokio::test]
+async fn legacy_account_actions_are_rejected() {
+    let root = tempfile::tempdir().unwrap();
+    let accounts =
+        zeron_engine::AgentAccounts::new(zeron_engine::AgentAccountsConfig::isolated(root.path()));
+    for id in [
+        zeron_proto::HarnessId::ClaudeCode,
+        zeron_proto::HarnessId::Codex,
+        zeron_proto::HarnessId::Cursor,
+        zeron_proto::HarnessId::Grok,
+    ] {
+        assert!(accounts.start_login(id).await.is_err());
+        assert!(accounts.activate(id, "0123456789abcdef").await.is_err());
+        assert!(accounts.forget(id, "0123456789abcdef").await.is_err());
+    }
+    assert!(accounts.list(false).await.unwrap().accounts.is_empty());
+}

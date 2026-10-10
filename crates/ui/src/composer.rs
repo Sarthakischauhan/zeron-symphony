@@ -10013,8 +10013,9 @@ impl Render for Composer {
                         .map(|chat| chat.device_id.clone())
                         .filter(|device| state.local_device_id.as_ref() != Some(device))
                 };
-                self.account_usage
-                    .update(cx, |usage, cx| usage.track(harness, target, cx));
+                self.account_usage.update(cx, |usage, cx| {
+                    usage.track(harness, target, self.pickers.clone(), cx)
+                });
             }
             container.child(
                 div()
@@ -10047,9 +10048,9 @@ impl Render for Composer {
                                 .opacity(session_chrome_opacity)
                                 .child(div().flex_1().min_w_0().children(footer.flatten()))
                                 .child(
-                                    // The footer row's own 4px gap: the PR badge
-                                    // ends flush with the row, so the rings keep
-                                    // their distance here.
+                                    // Account detail opens from the sidebar's
+                                    // Agent Usage line. This corner keeps the
+                                    // rings only.
                                     div()
                                         .flex_none()
                                         .pl(px(4.0))
