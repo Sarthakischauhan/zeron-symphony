@@ -92,14 +92,16 @@ impl TitleGenerator {
 
         let generated = self.run_title_model(harness_id, prompt, cwd).await;
         // Fallback so a chat is always named even if the model run produced nothing.
-        let fallback: String = prompt
-            .split_whitespace()
-            .take(7)
-            .collect::<Vec<_>>()
-            .join(" ")
-            .chars()
-            .take(48)
-            .collect();
+        let fallback = title_case(
+            &prompt
+                .split_whitespace()
+                .take(7)
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(48)
+                .collect::<String>(),
+        );
         let title = generated.unwrap_or(fallback);
         if title.is_empty() {
             return Ok(());
@@ -255,15 +257,34 @@ fn cheapest_model(models: &[Model]) -> Option<String> {
     small.or(models.last()).map(|m| m.id.clone())
 }
 
-/// First line, stripped of quote/heading dressing, capped at 60 chars.
+/// First line, stripped of quote/heading dressing, capped at 60 chars,
+/// then forced into Title Case. The prompt asks for it; models still return
+/// the user's lowercase sentence, which is what the sidebar was showing.
 fn clean_title(raw: &str) -> String {
     let first = raw.trim().lines().next().unwrap_or("");
-    first
+    let stripped = first
         .trim_start_matches(['"', '\'', '#', ' ', '\t'])
-        .trim_end_matches(['"', '\'', ' ', '\t'])
-        .chars()
-        .take(60)
-        .collect()
+        .trim_end_matches(['"', '\'', ' ', '\t']);
+    title_case(stripped).chars().take(60).collect()
+}
+
+fn title_case(raw: &str) -> String {
+    let mut titled = String::with_capacity(raw.len());
+    let mut new_word = true;
+    for ch in raw.chars() {
+        if ch.is_whitespace() || ch == '-' || ch == '/' {
+            new_word = true;
+            titled.push(ch);
+        } else if new_word {
+            for upper in ch.to_uppercase() {
+                titled.push(upper);
+            }
+            new_word = false;
+        } else {
+            titled.push(ch);
+        }
+    }
+    titled
 }
 
 /// Drive one titling run through the harness: no steering, questions resolved
@@ -335,6 +356,8 @@ mod tests {
             description: None,
             reasoning_levels: vec![],
             options: vec![],
+            context_limit: None,
+            provider: None,
         }
     }
 
@@ -498,5 +521,9 @@ mod tests {
         assert_eq!(clean_title("\"Fix Login Flow\"\nextra"), "Fix Login Flow");
         assert_eq!(clean_title("# Add Dark Mode  "), "Add Dark Mode");
         assert_eq!(clean_title("   "), "");
+        assert_eq!(
+            clean_title("some ongoing issues with scroll"),
+            "Some Ongoing Issues With Scroll"
+        );
     }
 }

@@ -1600,6 +1600,48 @@ fn account_menu_action(scope: Option<WorkspaceScope>, flow: SyncFlow) -> Option<
 /// The sidebar footer's profile label and the account menu's identity line.
 /// Anything without a signed-in account reads "Local"; the menu carries the
 /// storage/sync detail.
+/// One line under the sidebar account: the signed-in provider login and its
+/// binding quota. Empty when that login has no usage to report yet.
+fn sidebar_account_usage(
+    snapshot: Option<&zeron_proto::AgentAccountsSnapshot>,
+    harness: Option<zeron_proto::HarnessId>,
+    provider: Option<&str>,
+) -> Option<String> {
+    use crate::account_usage::{active_account, used_fraction};
+    use crate::settings::accounts::{format_reset, reports_usage};
+
+    let account = active_account(snapshot?, harness?, provider)?;
+    if !reports_usage(account.harness) {
+        return None;
+    }
+    let window = account.usage_windows.iter().max_by(|left, right| {
+        left.used_fraction
+            .partial_cmp(&right.used_fraction)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let Some(window) = window else {
+        return account
+            .usage_error
+            .clone()
+            .filter(|error| !error.is_empty());
+    };
+    let who = account
+        .email
+        .clone()
+        .or_else(|| account.display_name.clone())
+        .filter(|name| !name.trim().is_empty());
+    let percent = format!("{}%", (used_fraction(account)? * 100.0).round() as u32);
+    let reset = format_reset(window.resets_at, Utc::now());
+    let usage = match reset {
+        Some(reset) => format!("{percent} of {} · {reset}", window.label),
+        None => format!("{percent} of {}", window.label),
+    };
+    Some(match who {
+        Some(who) => format!("{who} · {usage}"),
+        None => usage,
+    })
+}
+
 fn sidebar_account_identity(
     scope: Option<WorkspaceScope>,
     flow: SyncFlow,
@@ -1921,6 +1963,11 @@ pub struct Shell {
     harness_update_geometry: [Option<WidthTween>; 2],
     harness_update_scroll: settings::widgets::PageScroll,
     user_menu: popover::Popup<()>,
+    /// Clicking the account card opens the renewal detail above it.
+    usage_menu: popover::Popup<()>,
+    /// One local-device account list, so the footer can show the signed-in
+    /// provider's quota without waiting for Settings or the composer to open.
+    account_usage_load: Option<Task<()>>,
     /// Inline sidebar error strip (mutation failures); click dismisses.
     sidebar_notice: Option<SharedString>,
     /// Repaints the update strip and dialog as the app-level update
@@ -2333,6 +2380,8 @@ impl Shell {
             harness_update_geometry: [None; 2],
             harness_update_scroll: settings::widgets::PageScroll::default(),
             user_menu: popover::Popup::default(),
+            usage_menu: popover::Popup::default(),
+            account_usage_load: None,
             sidebar_notice: None,
             _app_update_observation: crate::app_update::AppUpdate::global(cx)
                 .map(|update| cx.observe(&update, |_, _, cx| cx.notify())),
@@ -6793,7 +6842,7 @@ impl Shell {
         .into_any_element()
     }
 
-    /// One session row: context + status on line one, harness + title on line
+    /// One session row: context + status on line one, title on line
     /// two, and source metadata below. Working uses the live thread glyph in
     /// the status corner. Click selects; right-click opens the context menu.
     #[allow(clippy::too_many_arguments)]
@@ -6805,7 +6854,7 @@ impl Shell {
         space_name: SharedString,
         branch: Option<SharedString>,
         change_request: Option<zeron_proto::ChangeRequestSummary>,
-        harness: Option<zeron_proto::HarnessId>,
+        _harness: Option<zeron_proto::HarnessId>,
         status: zeron_proto::ChatIndicator,
         selected: bool,
         archived: bool,
@@ -6844,17 +6893,8 @@ impl Shell {
             .is_some_and(|chat| {
                 self.state.read(cx).local_device_id.as_deref() != Some(chat.device_id.as_str())
             });
-        let project_icon = (search_query.is_none() && self.settings.sidebar_show_project_icon)
-            .then(|| self.render_project_icon(&id, SIDEBAR_ACTIVE_HARNESS_ICON_SIZE, selected, cx));
         let corner_hovered = !preview && self.chat_status_hover.as_deref() == Some(row_id.as_str());
-        let archived_muted = archived && search_query.is_none() && !selected && !corner_hovered;
-        let project_icon = project_icon.map(|icon| {
-            div()
-                .flex_none()
-                .opacity(if archived_muted { 0.4 } else { 1.0 })
-                .child(icon)
-                .into_any_element()
-        });
+        let _archived_muted = archived && search_query.is_none() && !selected && !corner_hovered;
         let content_id = id.clone();
         // Send-truth overrides: a send unadopted past the grace window is
         // FAILED (explicit, with the transcript's retry affordance); a send
@@ -7274,24 +7314,6 @@ impl Shell {
                         SIDEBAR_ACTIVE_HARNESS_TITLE_GAP
                     }))
                     .children(compact_status)
-                    .when_some(
-                        harness.map(crate::pickers::harness_brand_icon),
-                        |el, (path, tint)| {
-                            el.child(
-                                icon(path)
-                                    .size(px(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE))
-                                    .flex_none()
-                                    .text_color(
-                                        tint.unwrap_or(subline).opacity(if archived_muted {
-                                            0.4
-                                        } else {
-                                            0.8
-                                        }),
-                                    ),
-                            )
-                        },
-                    )
-                    .children(project_icon)
                     .child(sidebar_faded_label(
                         format!("chat-title-{content_id}").into(),
                         true,
@@ -8353,13 +8375,256 @@ impl Shell {
             let state = self.state.read(cx);
             sidebar_account_identity(state.workspace_scope, self.sync_flow, state.auth_user())
         };
-        self.render_user_menu(user_line, menu_identity, theme, cx)
+        self.ensure_account_usage(cx);
+        let usage = self.sidebar_usage_line(cx);
+        self.render_user_menu(user_line, menu_identity, usage, theme, cx)
+    }
+
+    /// Paint the last known local-device accounts, then refresh them once.
+    fn ensure_account_usage(&mut self, cx: &mut Context<Self>) {
+        if self.account_usage_load.is_some() {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        self.account_usage_load = Some(cx.spawn(async move |this, cx| {
+            let fetch = |force| {
+                let engine = engine.clone();
+                async move {
+                    engine
+                        .client()
+                        .call(
+                            methods::LIST_AGENT_ACCOUNTS,
+                            serde_json::json!({ "forceUsage": force }),
+                        )
+                        .await
+                        .ok()
+                        .and_then(|value| {
+                            serde_json::from_value::<zeron_proto::AgentAccountsSnapshot>(value).ok()
+                        })
+                }
+            };
+            let store = |snapshot, cx: &mut gpui::AsyncApp| {
+                this.update(cx, |_, cx| {
+                    cx.default_global::<crate::settings::accounts::AccountsSnapshotCache>()
+                        .0
+                        .insert(None, snapshot);
+                    cx.notify();
+                })
+                .ok();
+            };
+            if let Some(snapshot) = fetch(false).await {
+                store(snapshot, cx);
+            }
+            if let Some(snapshot) = fetch(true).await {
+                store(snapshot, cx);
+            }
+        }));
+    }
+
+    /// Every usage window, with when it renews. Opened from the compact card.
+    fn sidebar_usage_detail(
+        &self,
+        account: &zeron_proto::AgentAccount,
+        theme: &Theme,
+        _cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let provider: SharedString = account
+            .provider
+            .as_deref()
+            .map(crate::account_usage::provider_label)
+            .unwrap_or_else(|| crate::settings::accounts::provider_name(account.harness).to_string())
+            .into();
+        popover::popover_card(theme)
+            .w(px(280.0))
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .child(popover::menu_heading(theme, &format!("{provider} usage")))
+            .children(account.usage_windows.iter().map(|window| {
+                let reset = crate::settings::accounts::format_reset(window.resets_at, Utc::now())
+                    .unwrap_or_else(|| "no reset time".into());
+                div()
+                    .px(px(8.0))
+                    .pb(px(4.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(crate::settings::accounts::render_usage_meter(window, theme))
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from(reset)),
+                    )
+            }))
+            .children(account.usage_error.clone().filter(|error| !error.is_empty()).map(|error| {
+                div()
+                    .px(px(8.0))
+                    .pb(px(6.0))
+                    .text_size(px(11.0))
+                    .text_color(theme.danger)
+                    .child(SharedString::from(error))
+            }))
+    }
+
+    /// The account card above Local. Click opens the renewal detail; the card
+    /// itself stays the compact provider, login, and weekly meter.
+    fn sidebar_usage_summary(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let pickers = self.composer.read(cx).pickers().read(cx);
+        let model = pickers.selected_model(cx);
+        let harness = pickers.effective_harness(cx)?;
+        let provider = model.and_then(|model| model.provider.clone());
+        let snapshot = cx
+            .try_global::<crate::settings::accounts::AccountsSnapshotCache>()?
+            .0
+            .get(&None)?;
+        let account =
+            crate::account_usage::active_account(snapshot, harness, provider.as_deref())?;
+        let account = account.clone();
+        let open = self.usage_menu.is_open();
+        let window = account.usage_windows.iter().max_by(|left, right| {
+            let rank = |label: &str| {
+                let label = label.to_ascii_lowercase();
+                if label.contains("week") {
+                    2
+                } else if label.contains("day") || label.contains("5 hour") {
+                    0
+                } else {
+                    1
+                }
+            };
+            rank(&left.label).cmp(&rank(&right.label))
+        });
+        let provider_name: SharedString = account
+            .provider
+            .as_deref()
+            .map(crate::account_usage::provider_label)
+            .unwrap_or_else(|| crate::settings::accounts::provider_name(account.harness).to_string())
+            .into();
+        let name: SharedString = account
+            .email
+            .clone()
+            .or_else(|| account.display_name.clone())
+            .unwrap_or_else(|| "Unknown account".into())
+            .into();
+        Some(
+            div()
+                .id("sidebar-account-usage")
+                .w_full()
+                .px(px(10.0))
+                .py(px(8.0))
+                .rounded(px(10.0))
+                .bg(theme.wash(0.06))
+                .flex()
+                .items_center()
+                .gap(px(10.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(px(10.5))
+                                .line_height(px(14.0))
+                                .text_color(theme.text_muted)
+                                .child(provider_name),
+                        )
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(px(13.0))
+                                .line_height(px(18.0))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(theme.text)
+                                .child(name),
+                        )
+                        .when(account.active, |column| {
+                            column.child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .line_height(px(15.0))
+                                    .text_color(theme.accent)
+                                    .child(SharedString::from("In use")),
+                            )
+                        }),
+                )
+                .children(window.cloned().map(|window| {
+                    let reset = crate::settings::accounts::format_reset(window.resets_at, Utc::now());
+                    div()
+                        .flex_none()
+                        .flex()
+                        .flex_col()
+                        .items_end()
+                        .gap(px(2.0))
+                        .child(crate::settings::accounts::render_usage_meter(&window, theme))
+                        .children(reset.map(|reset| {
+                            div()
+                                .text_size(px(10.5))
+                                .line_height(px(13.0))
+                                .text_color(theme.text_muted)
+                                .child(SharedString::from(reset))
+                        }))
+                }))
+                .cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, _| this.usage_menu.note_trigger_press()),
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if this.usage_menu.take_press_was_open() || this.usage_menu.is_open() {
+                        if this.usage_menu.begin_close() {
+                            popover::reap_popup(cx, |shell: &mut Self| &mut shell.usage_menu);
+                        }
+                    } else {
+                        this.usage_menu.open(());
+                    }
+                    cx.notify();
+                }))
+                .children(open.then(|| self.sidebar_usage_detail(&account, theme, cx)).map(|card| {
+                    popover::anchored_menu_above(
+                        "sidebar-usage-detail",
+                        card.on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                            if this.usage_menu.begin_close() {
+                                popover::reap_popup(cx, |shell: &mut Self| &mut shell.usage_menu);
+                            }
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                        self.usage_menu.closing_since(),
+                    )
+                }))
+                .into_any_element(),
+        )
+    }
+
+    fn sidebar_usage_line(&self, cx: &App) -> Option<String> {
+        let snapshot = cx
+            .try_global::<crate::settings::accounts::AccountsSnapshotCache>()?
+            .0
+            .get(&None)?;
+        let pickers = self.composer.read(cx).pickers().read(cx);
+        let model = pickers.selected_model(cx);
+        sidebar_account_usage(
+            Some(snapshot),
+            pickers.effective_harness(cx),
+            model.and_then(|model| model.provider.as_deref()),
+        )
     }
 
     fn render_user_menu(
         &mut self,
         user_line: SharedString,
         menu_identity: SharedString,
+        _usage: Option<String>,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -8559,16 +8824,24 @@ impl Shell {
             (true, true) => "Close settings · ⌘,".into(),
             (true, false) => "Close settings · Ctrl+,".into(),
         };
+        let usage_card = self.sidebar_usage_summary(theme, cx);
         div()
             .w_full()
             .flex()
-            .items_center()
-            .justify_between()
-            .gap(px(4.0))
-            .child(trigger)
+            .flex_col()
+            .gap(px(6.0))
+            .children(usage_card)
             .child(
                 div()
-                    .id("settings-trigger")
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(4.0))
+                    .child(trigger)
+                    .child(
+                        div()
+                            .id("settings-trigger")
                     .debug_selector(|| "settings-trigger".into())
                     .role(gpui::Role::Button)
                     .aria_label(if settings_open {
@@ -8618,6 +8891,7 @@ impl Shell {
                                 )
                             }),
                     ),
+                ),
             )
             .into_any_element()
     }
@@ -13289,6 +13563,60 @@ mod tests {
         assert_eq!(label(Some(WorkspaceScope::Synced), None), "Local");
         // Local-only storage stays "Local" even with a cached profile.
         assert_eq!(label(Some(WorkspaceScope::Local), Some(&named)), "Local");
+    }
+
+    #[test]
+    fn sidebar_usage_follows_the_selected_provider_account() {
+        use chrono::{TimeZone, Utc};
+        use zeron_proto::{AgentAccount, AgentAccountsSnapshot, AgentUsageWindow, HarnessId};
+
+        let account = |provider: &str, email: &str, used: f32| AgentAccount {
+            id: provider.into(),
+            harness: HarnessId::Symphony,
+            email: Some(email.into()),
+            plan_label: None,
+            active: true,
+            usage_windows: vec![AgentUsageWindow {
+                label: "Week".into(),
+                used_fraction: used,
+                resets_at: Some(Utc.with_ymd_and_hms(2026, 10, 17, 12, 0, 0).unwrap()),
+            }],
+            usage_fetched_at: None,
+            usage_error: None,
+            display_name: None,
+            organization: None,
+            auth_kind: None,
+            switchable: true,
+            saved_at: None,
+            provider: Some(provider.into()),
+        };
+        let snapshot = AgentAccountsSnapshot {
+            accounts: vec![
+                account("grok", "grok@example.com", 0.58),
+                account("openai", "ada@openai.com", 0.22),
+            ],
+            warnings: Vec::new(),
+        };
+        let line = sidebar_account_usage(
+            Some(&snapshot),
+            Some(HarnessId::Symphony),
+            Some("openai"),
+        )
+        .unwrap();
+        assert!(line.starts_with("ada@openai.com · 22% of Week · resets "));
+        assert!(sidebar_account_usage(Some(&snapshot), Some(HarnessId::Symphony), None).is_none());
+
+        let mut failed = account("grok", "grok@example.com", 0.0);
+        failed.usage_windows.clear();
+        failed.usage_error = Some("Rate limited — retrying in 2m".into());
+        let failed_snapshot = AgentAccountsSnapshot {
+            accounts: vec![failed],
+            warnings: Vec::new(),
+        };
+        assert_eq!(
+            sidebar_account_usage(Some(&failed_snapshot), Some(HarnessId::Symphony), Some("grok")),
+            Some("Rate limited — retrying in 2m".into())
+        );
     }
 
     #[test]

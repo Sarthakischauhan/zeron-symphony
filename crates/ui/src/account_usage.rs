@@ -1,9 +1,8 @@
 //! The composer footer's ring cluster. The plan-usage ring shows how much of
 //! the active account's rate limit the session's harness has used, beside
-//! the context ring. Clicking it opens the harness's accounts — each with its
-//! usage meters — and clicking one switches to it, the same `ActivateAgentAccount` Settings →
-//! Accounts runs. Both views share [`AccountsSnapshotCache`], so a switch in
-//! either shows up in the other.
+//! the context ring. Clicking it opens that one active account. Switching
+//! logins stays in Settings → Accounts. Both views share
+//! [`AccountsSnapshotCache`], so a switch there shows up here.
 use std::time::{Duration, Instant};
 
 use gpui::{
@@ -13,6 +12,7 @@ use gpui::{
 use zeron_proto::{AgentAccount, AgentAccountsSnapshot, HarnessId};
 use zeron_rpc::methods;
 
+use crate::pickers::Pickers;
 use crate::popover;
 use crate::settings::accounts::{
     self, AccountsSnapshotCache, UsageLevel, render_usage_meter, reports_usage, signs_in,
@@ -36,20 +36,33 @@ pub fn used_fraction(account: &AgentAccount) -> Option<f32> {
         .reduce(f32::max)
 }
 
-/// The harness's live account, when it reports usage. Pure.
-pub fn active_account(
-    snapshot: &AgentAccountsSnapshot,
+/// The login for the selected model, or the harness's only live login. Pure.
+pub fn active_account<'a>(
+    snapshot: &'a AgentAccountsSnapshot,
     harness: HarnessId,
-) -> Option<&AgentAccount> {
-    snapshot
+    provider: Option<&str>,
+) -> Option<&'a AgentAccount> {
+    let matches = snapshot
         .accounts
         .iter()
-        .find(|account| account.harness == harness && account.active)
+        .filter(|account| account.harness == harness && account.active);
+    if let Some(provider) = provider {
+        if let Some(account) = matches
+            .clone()
+            .find(|account| account.provider.as_deref() == Some(provider))
+        {
+            return Some(account);
+        }
+    }
+    let mut matches = matches;
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first)
 }
 
 /// Loads (and switches) the accounts of the composer's target device.
 pub struct AccountUsage {
     state: Entity<AppState>,
+    pickers: Option<Entity<Pickers>>,
     /// `None` = this device, as in [`AccountsSnapshotCache`].
     target: Option<String>,
     harness: Option<HarnessId>,
@@ -58,7 +71,6 @@ pub struct AccountUsage {
     last_forced: Option<Instant>,
     error: Option<SharedString>,
     load_task: Option<Task<()>>,
-    action_task: Option<Task<()>>,
     popup: popover::Popup<FooterCard>,
     _poll: Task<()>,
     _cache: Subscription,
@@ -85,13 +97,13 @@ impl AccountUsage {
         Self {
             _state: cx.observe(&state, |_, _, cx| cx.notify()),
             state,
+            pickers: None,
             target: None,
             harness: None,
             loaded: false,
             last_forced: None,
             error: None,
             load_task: None,
-            action_task: None,
             popup: popover::Popup::default(),
             _poll: poll,
             // Settings → Accounts writes the same cache.
@@ -105,8 +117,12 @@ impl AccountUsage {
         &mut self,
         harness: Option<HarnessId>,
         target: Option<String>,
+        pickers: Entity<Pickers>,
         cx: &mut Context<Self>,
     ) {
+        if self.pickers.is_none() {
+            self.pickers = Some(pickers);
+        }
         let harness = harness.filter(|h| signs_in(*h) && reports_usage(*h));
         self.harness = harness;
         if self.target != target {
@@ -185,59 +201,15 @@ impl AccountUsage {
         }));
     }
 
-    /// Switch optimistically, like Settings → Accounts: the rows flip at once
-    /// and the engine's reply replaces them; a refusal restores the list.
-    fn switch(&mut self, account: &AgentAccount, cx: &mut Context<Self>) {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            return;
-        };
-        let key = self.target.clone();
-        let cache = &mut cx.default_global::<AccountsSnapshotCache>().0;
-        let previous = cache.get(&key).cloned();
-        if let Some(snapshot) = cache.get_mut(&key) {
-            // Per-provider agents keep one live login per provider: only the
-            // switched-to row's group changes.
-            accounts::mark_switched(snapshot, account);
-        }
-        self.error = None;
-        let params = self.params(serde_json::json!({
-            "id": account.id,
-            "accountId": account.id,
-            "harness": account.harness,
-        }));
-        self.action_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(methods::ACTIVATE_AGENT_ACCOUNT, params)
-                .await;
-            this.update(cx, |usage, cx| {
-                match result.map(serde_json::from_value::<AgentAccountsSnapshot>) {
-                    Ok(Ok(snapshot)) => {
-                        cx.default_global::<AccountsSnapshotCache>()
-                            .0
-                            .insert(key, snapshot);
-                    }
-                    Ok(Err(_)) => usage.load(false, cx),
-                    Err(err) => {
-                        if let Some(previous) = previous {
-                            cx.default_global::<AccountsSnapshotCache>()
-                                .0
-                                .insert(key, previous);
-                        }
-                        usage.error = Some(err.to_string().into());
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
-        }));
-        cx.notify();
-    }
-
     /// The ring's reading: the live account's most-used window, when the
     /// harness has a live account with usage to show.
     fn fraction(&self, cx: &gpui::App) -> Option<f32> {
-        used_fraction(active_account(self.snapshot(cx)?, self.harness?)?)
+        let provider = self.selected_model(cx).and_then(|model| model.provider);
+        used_fraction(active_account(
+            self.snapshot(cx)?,
+            self.harness?,
+            provider.as_deref(),
+        )?)
     }
 
     /// A trigger click: open this ring's popover, or close it when the
@@ -297,18 +269,25 @@ impl AccountUsage {
         .into_any_element()
     }
 
-    fn accounts_card(&self, cx: &mut Context<Self>) -> gpui::Div {
+    fn selected_model(&self, cx: &gpui::App) -> Option<zeron_proto::Model> {
+        self.pickers.as_ref()?.read(cx).selected_model(cx).cloned()
+    }
+
+    fn selected_model_limit(&self, cx: &gpui::App) -> Option<u64> {
+        self.selected_model(cx)?.context_limit
+    }
+
+    fn accounts_card(&self, cx: &gpui::App) -> gpui::Div {
         let theme = &Theme::of(cx).for_popup();
         let harness = self.harness;
-        let rows: Vec<AgentAccount> = match (harness, self.snapshot(cx)) {
-            (Some(harness), Some(snapshot)) => accounts::provider_accounts(snapshot, harness)
-                .into_iter()
-                .cloned()
-                .collect(),
-            _ => Vec::new(),
-        };
+        let provider = self.selected_model(cx).and_then(|model| model.provider);
+        let account = harness
+            .zip(self.snapshot(cx))
+            .and_then(|(harness, snapshot)| {
+                active_account(snapshot, harness, provider.as_deref()).cloned()
+            });
         let title = format!(
-            "{} accounts",
+            "{} account",
             harness.map_or("Agent", accounts::provider_name)
         );
         popover::popover_card(theme)
@@ -316,14 +295,19 @@ impl AccountUsage {
             .flex()
             .flex_col()
             .child(popover::menu_heading(theme, &title))
-            .children(rows.iter().enumerate().map(|(ix, account)| {
+            .children(account.as_ref().map(|account| {
                 let email: SharedString = account
                     .email
                     .clone()
                     .or_else(|| account.display_name.clone())
                     .unwrap_or_else(|| "Unknown account".into())
                     .into();
-                let can_switch = !account.active && account.switchable;
+                let provider: SharedString = account
+                    .provider
+                    .as_deref()
+                    .map(provider_label)
+                    .unwrap_or_else(|| accounts::provider_name(account.harness).to_string())
+                    .into();
                 let mut meta: Vec<gpui::AnyElement> = account
                     .plan_label
                     .iter()
@@ -347,19 +331,20 @@ impl AccountUsage {
                 {
                     meta.push(div().child(SharedString::from(reason)).into_any_element());
                 }
-                let switch_to = account.clone();
-                popover::menu_row(theme, account.active, format!("account-usage-row-{ix}"))
-                    .id(("account-usage-row", ix))
-                    .when(!can_switch, |row| row.cursor_default())
-                    .when(can_switch, |row| {
-                        row.on_click(cx.listener(move |usage, _, _, cx| {
-                            usage.switch(&switch_to, cx);
-                        }))
-                    })
+                popover::menu_row(theme, true, "account-usage-row".to_string())
+                    .id("account-usage-row")
+                    .cursor_pointer()
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(10.5))
+                                    .text_color(theme.text_muted)
+                                    .child(provider),
+                            )
                             .child(
                                 div()
                                     .truncate()
@@ -392,6 +377,27 @@ impl AccountUsage {
     }
 }
 
+/// Convert provider ids into readable labels while preserving unknown ids.
+pub(crate) fn provider_label(provider: &str) -> String {
+    match provider.to_ascii_lowercase().as_str() {
+        "openai" | "chatgpt" => "ChatGPT".into(),
+        "anthropic" | "claude" => "Claude".into(),
+        "google" | "gemini" => "Gemini".into(),
+        "xai" | "grok" => "Grok".into(),
+        "github-copilot" => "GitHub Copilot".into(),
+        other => other
+            .split(['-', '_'])
+            .map(|part| {
+                let mut chars = part.chars();
+                chars.next().map_or_else(String::new, |first| {
+                    first.to_uppercase().collect::<String>() + chars.as_str()
+                })
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
 /// Which footer ring's popover is up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FooterCard {
@@ -413,28 +419,10 @@ impl FooterCard {
 impl Render for AccountUsage {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
-        let context = self.state.read(cx).context_usage;
-        let account = self.fraction(cx).map(|fraction| {
-            let level = usage_level(fraction);
-            let chip = crate::context_usage::ring_chip(
-                "account-usage",
-                fraction,
-                usage_color(level, &theme),
-                match level {
-                    UsageLevel::Normal => theme.text_muted,
-                    _ => usage_color(level, &theme),
-                },
-                format!("{}%", (fraction * 100.0).round() as u32),
-                self.popup.get() == Some(&FooterCard::Accounts),
-                &theme,
-            );
-            self.trigger(
-                chip,
-                FooterCard::Accounts,
-                |usage, cx| usage.accounts_card(cx),
-                cx,
-            )
-        });
+        let context = crate::context_usage::for_model(
+            self.state.read(cx).context_usage,
+            self.selected_model_limit(cx),
+        );
         let context = crate::context_usage::has_window(context).then(|| {
             let chip = crate::context_usage::chip(
                 context,
@@ -452,7 +440,6 @@ impl Render for AccountUsage {
             .flex()
             .items_center()
             .gap(px(4.0))
-            .children(account)
             .children(context)
     }
 }
@@ -506,9 +493,28 @@ mod tests {
             warnings: Vec::new(),
         };
         assert_eq!(
-            active_account(&snapshot, HarnessId::Codex).map(|a| a.id.as_str()),
+            active_account(&snapshot, HarnessId::Codex, None).map(|a| a.id.as_str()),
             Some("Codex-true")
         );
-        assert!(active_account(&snapshot, HarnessId::Cursor).is_none());
+        assert!(active_account(&snapshot, HarnessId::Cursor, None).is_none());
+    }
+
+    #[test]
+    fn multiple_active_providers_resolve_to_the_selected_one() {
+        let mut grok = account(HarnessId::Symphony, true, &[0.58]);
+        grok.provider = Some("grok".into());
+        grok.id = "grok".into();
+        let mut openai = account(HarnessId::Symphony, true, &[0.22]);
+        openai.provider = Some("openai".into());
+        openai.id = "openai".into();
+        let snapshot = AgentAccountsSnapshot {
+            accounts: vec![grok, openai],
+            warnings: Vec::new(),
+        };
+        assert_eq!(
+            active_account(&snapshot, HarnessId::Symphony, Some("openai")).map(|a| a.id.as_str()),
+            Some("openai")
+        );
+        assert!(active_account(&snapshot, HarnessId::Symphony, None).is_none());
     }
 }
