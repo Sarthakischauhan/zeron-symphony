@@ -1963,8 +1963,6 @@ pub struct Shell {
     harness_update_geometry: [Option<WidthTween>; 2],
     harness_update_scroll: settings::widgets::PageScroll,
     user_menu: popover::Popup<()>,
-    /// Clicking the account card opens the renewal detail above it.
-    usage_menu: popover::Popup<()>,
     /// One local-device account list, so the footer can show the signed-in
     /// provider's quota without waiting for Settings or the composer to open.
     account_usage_load: Option<Task<()>>,
@@ -2380,7 +2378,6 @@ impl Shell {
             harness_update_geometry: [None; 2],
             harness_update_scroll: settings::widgets::PageScroll::default(),
             user_menu: popover::Popup::default(),
-            usage_menu: popover::Popup::default(),
             account_usage_load: None,
             sidebar_notice: None,
             _app_update_observation: crate::app_update::AppUpdate::global(cx)
@@ -8423,92 +8420,17 @@ impl Shell {
         }));
     }
 
-    /// Every usage window, with when it renews. Opened from the compact card.
-    fn sidebar_usage_detail(
-        &self,
+    /// One signed-in account: logo, email, plan, then its usage windows.
+    /// Hover only. The row does not open anything.
+    fn sidebar_usage_row(
         account: &zeron_proto::AgentAccount,
         theme: &Theme,
-        _cx: &mut Context<Self>,
-    ) -> gpui::Div {
-        let provider: SharedString = account
-            .provider
-            .as_deref()
-            .map(crate::account_usage::provider_label)
-            .unwrap_or_else(|| crate::settings::accounts::provider_name(account.harness).to_string())
-            .into();
-        popover::popover_card(theme)
-            .w(px(280.0))
-            .flex()
-            .flex_col()
-            .gap(px(6.0))
-            .child(popover::menu_heading(theme, &format!("{provider} usage")))
-            .children(account.usage_windows.iter().map(|window| {
-                let reset = crate::settings::accounts::format_reset(window.resets_at, Utc::now())
-                    .unwrap_or_else(|| "no reset time".into());
-                div()
-                    .px(px(8.0))
-                    .pb(px(4.0))
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.0))
-                    .child(crate::settings::accounts::render_usage_meter(window, theme))
-                    .child(
-                        div()
-                            .text_size(px(11.0))
-                            .text_color(theme.text_muted)
-                            .child(SharedString::from(reset)),
-                    )
-            }))
-            .children(account.usage_error.clone().filter(|error| !error.is_empty()).map(|error| {
-                div()
-                    .px(px(8.0))
-                    .pb(px(6.0))
-                    .text_size(px(11.0))
-                    .text_color(theme.danger)
-                    .child(SharedString::from(error))
-            }))
-    }
-
-    /// The account card above Local. Click opens the renewal detail; the card
-    /// itself stays the compact provider, login, and weekly meter.
-    fn sidebar_usage_summary(
-        &mut self,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> Option<gpui::AnyElement> {
-        let pickers = self.composer.read(cx).pickers().read(cx);
-        let model = pickers.selected_model(cx);
-        let harness = pickers.effective_harness(cx)?;
-        let provider = model.and_then(|model| model.provider.clone());
-        let snapshot = cx
-            .try_global::<crate::settings::accounts::AccountsSnapshotCache>()?
-            .0
-            .get(&None)?;
-        let account =
-            crate::account_usage::active_account(snapshot, harness, provider.as_deref())?;
-        let account = account.clone();
-        let open = self.usage_menu.is_open();
-        let window = account.usage_windows.iter().max_by(|left, right| {
-            let rank = |label: &str| {
-                let label = label.to_ascii_lowercase();
-                if label.contains("week") {
-                    2
-                } else if label.contains("day") || label.contains("5 hour") {
-                    0
-                } else {
-                    1
-                }
-            };
-            rank(&left.label).cmp(&rank(&right.label))
-        });
+    ) -> gpui::AnyElement {
         let (mark, tint) = account
             .provider
             .as_deref()
             .map(|provider| {
-                crate::pickers::model_brand_icon(
-                    account.harness,
-                    &format!("{provider}:account"),
-                )
+                crate::pickers::model_brand_icon(account.harness, &format!("{provider}:account"))
             })
             .unwrap_or_else(|| crate::pickers::harness_brand_icon(account.harness));
         let email: SharedString = account
@@ -8516,102 +8438,152 @@ impl Shell {
             .clone()
             .filter(|email| email.contains('@'))
             .or_else(|| account.display_name.clone().filter(|name| name.contains('@')))
-            .unwrap_or_else(|| "No email".into())
+            .unwrap_or_else(|| {
+                account
+                    .display_name
+                    .clone()
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or_else(|| "Signed in".into())
+            })
             .into();
+        let plan = account.plan_label.clone().filter(|plan| !plan.trim().is_empty());
+        let provider = account
+            .provider
+            .as_deref()
+            .map(crate::account_usage::provider_label)
+            .filter(|name| !name.is_empty());
+        let mut windows: Vec<_> = account.usage_windows.iter().collect();
+        windows.sort_by_key(|window| {
+            let label = window.label.to_ascii_lowercase();
+            if label.contains("session") || label.contains("5 hour") || label.contains("day") {
+                0
+            } else if label.contains("week") {
+                1
+            } else {
+                2
+            }
+        });
+        windows.truncate(2);
+        let meta = match (plan, provider) {
+            (Some(plan), _) => Some(plan),
+            (None, Some(provider)) if account.active => Some(provider),
+            _ => None,
+        };
+        div()
+            .id(SharedString::from(format!("sidebar-usage-{}", account.id)))
+            .w_full()
+            .px(px(8.0))
+            .py(px(6.0))
+            .rounded(px(8.0))
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .hover(|style| style.bg(theme.wash(0.06)))
+            .child(
+                div()
+                    .flex_none()
+                    .size(px(28.0))
+                    .rounded_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(theme.wash(0.06))
+                    .child(
+                        icon(mark)
+                            .size(px(15.0))
+                            .text_color(tint.unwrap_or(theme.text)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(1.0))
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(12.0))
+                            .line_height(px(16.0))
+                            .text_color(theme.text)
+                            .child(email),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .gap(px(4.0))
+                            .children(meta.map(|meta| {
+                                div()
+                                    .truncate()
+                                    .text_size(px(11.0))
+                                    .line_height(px(14.0))
+                                    .text_color(theme.text_muted)
+                                    .child(SharedString::from(meta))
+                                    .into_any_element()
+                            }))
+                            .when(account.active, |row| {
+                                row.child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(px(11.0))
+                                        .line_height(px(14.0))
+                                        .text_color(theme.accent)
+                                        .child(SharedString::from("In use")),
+                                )
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .flex_col()
+                    .items_end()
+                    .gap(px(2.0))
+                    .children(
+                        windows
+                            .into_iter()
+                            .map(|window| crate::settings::accounts::render_usage_meter(window, theme)),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// Signed-in accounts above Local. Logos instead of names, meters on the
+    /// right. Hover highlights a row; nothing opens.
+    fn sidebar_usage_summary(&self, theme: &Theme, cx: &App) -> Option<gpui::AnyElement> {
+        let snapshot = cx
+            .try_global::<crate::settings::accounts::AccountsSnapshotCache>()?
+            .0
+            .get(&None)?;
+        let mut accounts: Vec<_> = snapshot
+            .accounts
+            .iter()
+            .filter(|account| {
+                crate::settings::accounts::reports_usage(account.harness)
+                    && (!account.usage_windows.is_empty() || account.active)
+            })
+            .collect();
+        if accounts.is_empty() {
+            return None;
+        }
+        accounts.sort_by_key(|account| !account.active);
+        accounts.truncate(4);
         Some(
             div()
                 .id("sidebar-account-usage")
                 .w_full()
-                .px(px(10.0))
-                .py(px(8.0))
-                .rounded(px(10.0))
-                .bg(theme.wash(0.06))
                 .flex()
-                .items_center()
-                .gap(px(10.0))
-                .child(
-                    div()
-                        .flex_none()
-                        .size(px(22.0))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(
-                            icon(mark)
-                                .size(px(16.0))
-                                .text_color(tint.unwrap_or(theme.text)),
-                        ),
+                .flex_col()
+                .gap(px(2.0))
+                .children(
+                    accounts
+                        .into_iter()
+                        .map(|account| Self::sidebar_usage_row(account, theme)),
                 )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .flex()
-                        .flex_col()
-                        .child(
-                            div()
-                                .truncate()
-                                .text_size(px(12.5))
-                                .line_height(px(17.0))
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .text_color(theme.text)
-                                .child(email),
-                        )
-                        .when(account.active, |column| {
-                            column.child(
-                                div()
-                                    .text_size(px(11.0))
-                                    .line_height(px(15.0))
-                                    .text_color(theme.accent)
-                                    .child(SharedString::from("In use")),
-                            )
-                        }),
-                )
-                .children(window.cloned().map(|window| {
-                    let reset = crate::settings::accounts::format_reset(window.resets_at, Utc::now());
-                    div()
-                        .flex_none()
-                        .flex()
-                        .flex_col()
-                        .items_end()
-                        .gap(px(2.0))
-                        .child(crate::settings::accounts::render_usage_meter(&window, theme))
-                        .children(reset.map(|reset| {
-                            div()
-                                .text_size(px(10.5))
-                                .line_height(px(13.0))
-                                .text_color(theme.text_muted)
-                                .child(SharedString::from(reset))
-                        }))
-                }))
-                .cursor_pointer()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, _| this.usage_menu.note_trigger_press()),
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    if this.usage_menu.take_press_was_open() || this.usage_menu.is_open() {
-                        if this.usage_menu.begin_close() {
-                            popover::reap_popup(cx, |shell: &mut Self| &mut shell.usage_menu);
-                        }
-                    } else {
-                        this.usage_menu.open(());
-                    }
-                    cx.notify();
-                }))
-                .children(open.then(|| self.sidebar_usage_detail(&account, theme, cx)).map(|card| {
-                    popover::anchored_menu_above(
-                        "sidebar-usage-detail",
-                        card.on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                            if this.usage_menu.begin_close() {
-                                popover::reap_popup(cx, |shell: &mut Self| &mut shell.usage_menu);
-                            }
-                            cx.notify();
-                        }))
-                        .into_any_element(),
-                        self.usage_menu.closing_since(),
-                    )
-                }))
                 .into_any_element(),
         )
     }
