@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="crates/ui/assets/icons/symphony-logo.svg" alt="Symphony" width="585">
+</p>
+
 # Zeron Symphony
 
 A native Rust/GPUI desktop workspace for the [Symphony coding agent](https://github.com/Sarthakischauhan/symphony). Zeron owns the chat UI, workspace, terminal, browser, diffs, and optional device sync. Symphony owns model execution, tools, skills, plugins, approvals, and checkpoints.
