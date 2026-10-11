@@ -33,6 +33,8 @@
         <string>__DATA_DIR__</string>
         <key>ZERON_IPC_PORT</key>
         <string>__IPC_PORT__</string>
+        <key>ZERON_RELEASES_URL</key>
+        <string>off</string>
     </dict>
     <key>NSHighResolutionCapable</key>
     <true/>

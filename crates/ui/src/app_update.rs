@@ -260,6 +260,18 @@ impl AppUpdate {
     /// found release starts downloading at once (it would anyway on the
     /// hourly check), and a failed download gets a fresh attempt.
     pub fn check_for_updates(&mut self, cx: &mut Context<Self>) {
+        if !zeron_update::upstream_updates_enabled() {
+            self.status = Some(zeron_update::UpdateStatus {
+                current_version: zeron_update::current_version().to_string(),
+                latest_version: None,
+                update_available: false,
+                checked_at: None,
+                error: None,
+            });
+            self.prompt = Some(Prompt::Result);
+            cx.notify();
+            return;
+        }
         self.prompt = Some(Prompt::Checking);
         let checker = self.checker.clone();
         let check = Tokio::spawn(cx, async move { checker.check().await });
@@ -362,6 +374,9 @@ impl AppUpdate {
     /// The sidebar strip for the current state: `None` while there is
     /// nothing newer (or the advisory was dismissed for this version).
     pub fn strip(&self) -> Option<(SharedString, StripAction)> {
+        if !zeron_update::upstream_updates_enabled() {
+            return None;
+        }
         let latest = self.available()?;
         if self.dismissed.as_deref() == Some(latest) {
             return None;

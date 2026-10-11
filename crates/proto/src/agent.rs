@@ -192,6 +192,12 @@ pub struct Model {
     pub reasoning_levels: Vec<ReasoningLevel>,
     #[serde(default)]
     pub options: Vec<ModelOption>,
+    /// The model's input context capacity, when the harness catalog reports one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_limit: Option<u64>,
+    /// Upstream provider id (`openai`, `grok`, …) for agents that keep one login per provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
