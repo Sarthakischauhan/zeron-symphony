@@ -8489,9 +8489,7 @@ impl Shell {
                     .justify_center()
                     .bg(theme.wash(0.06))
                     .child(
-                        icon(mark)
-                            .size(px(15.0))
-                            .text_color(tint.unwrap_or(theme.text)),
+                        icons::brand_icon(mark, px(15.0), tint.unwrap_or(theme.text)),
                     ),
             )
             .child(
@@ -10076,12 +10074,7 @@ impl Shell {
                         .flex()
                         .flex_col()
                         .items_center()
-                        .child(
-                            icon(icons::ZERON_LOGO)
-                                .w(px(41.9))
-                                .h(px(48.0))
-                                .text_color(theme.text.opacity(0.09)),
-                        )
+                        .child(icons::symphony_logo(px(48.0)))
                         .child(
                             div()
                                 .mt(px(24.0))
@@ -10880,12 +10873,7 @@ impl Shell {
             .flex_col()
             .items_center()
             .text_center()
-            .child(
-                icon(icons::ZERON_LOGO)
-                    .w(px(31.4))
-                    .h(px(36.0))
-                    .text_color(theme.text),
-            )
+            .child(icons::symphony_logo(px(36.0)))
             .child(
                 div()
                     .mt(px(24.0))
@@ -11597,12 +11585,7 @@ impl Shell {
                 .flex_col()
                 .items_center()
                 .text_center()
-                .child(
-                    icon(icons::ZERON_LOGO)
-                        .w(px(31.4))
-                        .h(px(36.0))
-                        .text_color(theme.text),
-                )
+                .child(icons::symphony_logo(px(36.0)))
                 .child(
                     div()
                         .mt(px(24.0))
@@ -11783,12 +11766,7 @@ impl Shell {
             .shadow_lg()
             .flex()
             .flex_col()
-            .child(
-                icon(icons::ZERON_LOGO)
-                    .w(px(24.4))
-                    .h(px(28.0))
-                    .text_color(theme.text),
-            )
+            .child(icons::symphony_logo(px(28.0)))
             .child(
                 div()
                     .mt(px(20.0))

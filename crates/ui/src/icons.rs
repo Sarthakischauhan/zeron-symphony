@@ -221,6 +221,7 @@ icon_assets![
     (HERMES_MARK, "hermes-mark"),
     (PI_MARK, "pi-mark"),
     (SYMPHONY_MARK, "symphony-mark"),
+    (SYMPHONY_LOGO, "symphony-logo"),
     (OPENCODE_MARK, "opencode-mark"),
     (ANTIGRAVITY_MARK, "antigravity-mark"),
 ];
@@ -257,6 +258,25 @@ pub fn icon(path: &'static str) -> Svg {
     svg().path(path).flex_none()
 }
 
+/// Preserve the authored colors of Symphony artwork; other brand marks retain
+/// their existing monochrome surface tint.
+pub fn brand_icon(path: &'static str, size: gpui::Pixels, tint: Hsla) -> gpui::AnyElement {
+    use gpui::IntoElement as _;
+    if path == SYMPHONY_MARK || path == SYMPHONY_LOGO {
+        gpui::img(path).size(size).flex_none().into_any_element()
+    } else {
+        icon(path).size(size).text_color(tint).into_any_element()
+    }
+}
+
+/// Full-color wordmark, sized to its original aspect ratio.
+pub fn symphony_logo(height: gpui::Pixels) -> gpui::Img {
+    gpui::img(SYMPHONY_LOGO)
+        .w(height * (585.0 / 110.0))
+        .h(height)
+        .flex_none()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,6 +293,29 @@ mod tests {
             assert!(text.contains("<svg"), "{path} is not an svg");
             assert!(text.contains("viewBox"), "{path} lacks a viewBox");
         }
+    }
+
+    #[test]
+    fn symphony_artwork_preserves_authored_color_and_geometry() {
+        let assets = Assets;
+        for (path, view_box) in [
+            (SYMPHONY_LOGO, "0 0 585 110"),
+            (SYMPHONY_MARK, "0 0 110 110"),
+        ] {
+            let bytes = assets
+                .load(path)
+                .unwrap()
+                .expect("embedded Symphony artwork");
+            let svg = std::str::from_utf8(&bytes).unwrap();
+            assert!(svg.contains(view_box));
+            assert!(svg.contains("#ff5357"));
+            assert!(!svg.contains("currentColor"));
+        }
+        let logo = assets.load(SYMPHONY_LOGO).unwrap().unwrap();
+        assert_eq!(
+            logo.as_ref(),
+            include_bytes!("../assets/icons/symphony-logo.svg")
+        );
     }
 
     #[test]

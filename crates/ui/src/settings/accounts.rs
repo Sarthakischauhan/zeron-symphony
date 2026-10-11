@@ -1970,9 +1970,7 @@ impl Render for AccountsPage {
                 .items_center()
                 .justify_center()
                 .child(
-                    crate::icons::icon(mark)
-                        .size(px(16.0))
-                        .text_color(tint.unwrap_or(theme.text_muted)),
+                    crate::icons::brand_icon(mark, px(16.0), tint.unwrap_or(theme.text_muted)),
                 )
         };
 

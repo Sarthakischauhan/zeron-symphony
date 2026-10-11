@@ -2878,9 +2878,7 @@ impl Pickers {
                 (!icon_loading).then_some(chip_icon).flatten(),
                 |el, (path, tint)| {
                     el.child(
-                        crate::icons::icon(path)
-                            .size(px(16.0))
-                            .text_color(tint.unwrap_or(theme.text_muted)),
+                        crate::icons::brand_icon(path, px(16.0), tint.unwrap_or(theme.text_muted)),
                     )
                 },
             )
@@ -3829,7 +3827,9 @@ impl Pickers {
                             this.pick_harness(harness, cx);
                             cx.notify();
                         }))
-                        .child(crate::icons::icon(icon_path).size(px(16.0)).text_color(
+                        .child(crate::icons::brand_icon(
+                            icon_path,
+                            px(16.0),
                             tint.unwrap_or(if is_viewed {
                                 theme.text
                             } else {
@@ -4134,10 +4134,7 @@ impl Pickers {
                         .items_center()
                         .gap(px(6.0))
                         .child(
-                            crate::icons::icon(icon_path)
-                                .size(px(11.0))
-                                .flex_none()
-                                .text_color(tint.unwrap_or(theme.text_muted)),
+                            crate::icons::brand_icon(icon_path, px(11.0), tint.unwrap_or(theme.text_muted)),
                         )
                         .child(
                             div()
