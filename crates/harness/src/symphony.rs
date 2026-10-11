@@ -354,6 +354,16 @@ fn catalog_models(frame: &Value, request_id: &str) -> Result<Vec<Model>, Harness
                 description: Some(field(item, "description").into()),
                 reasoning_levels,
                 options: vec![],
+                context_limit: item["context_limit"].as_u64().filter(|limit| *limit > 0),
+                provider: item["provider"]
+                    .as_str()
+                    .filter(|provider| !provider.is_empty())
+                    .map(str::to_string)
+                    .or_else(|| {
+                        id.split_once(':')
+                            .map(|(provider, _)| provider.to_string())
+                            .filter(|provider| !provider.is_empty())
+                    }),
             })
         })
         .collect())
@@ -633,6 +643,8 @@ impl Harness for SymphonyHarness {
             description: Some("Uses the model configured in Symphony".into()),
             reasoning_levels: vec![],
             options: vec![],
+            context_limit: None,
+            provider: None,
         }]
     }
     fn release_session(&self, session_id: &str) {
@@ -1349,12 +1361,12 @@ mod tests {
         let frame = json!({
             "type":"models", "protocol_version":2, "request_id":"probe-1",
             "models":[{"id":"openai:gpt-test", "label":"gpt-test",
-                       "description":"openai", "reasoning_levels":[]}]
+                       "description":"openai", "provider":"openai", "reasoning_levels":[], "context_limit":128000}]
         });
-        assert_eq!(
-            catalog_models(&frame, "probe-1").unwrap()[0].id,
-            "openai:gpt-test"
-        );
+        let models = catalog_models(&frame, "probe-1").unwrap();
+        assert_eq!(models[0].id, "openai:gpt-test");
+        assert_eq!(models[0].context_limit, Some(128_000));
+        assert_eq!(models[0].provider.as_deref(), Some("openai"));
         assert!(catalog_models(&frame, "probe-2").is_err());
     }
 

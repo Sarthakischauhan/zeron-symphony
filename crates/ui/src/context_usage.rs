@@ -147,21 +147,68 @@ fn details(usage: Option<ContextUsage>) -> String {
     }
 }
 
+/// Prefer the model selected in the composer. A chat's last reported window
+/// belongs to whatever model produced it, so it must not outlive a switch.
+pub fn for_model(usage: Option<ContextUsage>, model_limit: Option<u64>) -> Option<ContextUsage> {
+    let model_limit = model_limit.filter(|limit| *limit > 0);
+    match (usage, model_limit) {
+        (Some(mut usage), Some(limit)) => {
+            usage.window = Some(limit);
+            Some(usage)
+        }
+        (None, Some(limit)) => Some(ContextUsage {
+            tokens: None,
+            window: Some(limit),
+        }),
+        (usage, None) => usage,
+    }
+}
+
 /// The context ring's popover content.
 pub fn card(usage: Option<ContextUsage>, theme: &Theme) -> gpui::Div {
+    let fraction = usage.and_then(ContextUsage::fraction).unwrap_or(0.0) as f32;
+    let color = match fraction {
+        value if value >= 0.9 => theme.danger,
+        value if value >= 0.75 => theme.warning,
+        _ => theme.accent,
+    };
     crate::popover::popover_card(theme)
+        .w(px(280.0))
         .flex()
         .flex_col()
         .child(crate::popover::menu_heading(theme, "Context window"))
         .child(
             div()
                 .px(px(8.0))
-                .pb(px(6.0))
-                .text_size(px(12.0))
-                .line_height(px(19.0))
-                .whitespace_nowrap()
-                .text_color(theme.text_muted)
-                .child(SharedString::from(details(usage))),
+                .pb(px(8.0))
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .h(px(6.0))
+                        .w_full()
+                        .rounded_full()
+                        .overflow_hidden()
+                        .bg(theme.wash(0.08))
+                        .when(fraction > 0.0, |bar| {
+                            bar.child(
+                                div()
+                                    .h_full()
+                                    .w(gpui::relative(fraction.clamp(0.015, 1.0)))
+                                    .rounded_full()
+                                    .bg(color),
+                            )
+                        }),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .line_height(px(19.0))
+                        .whitespace_nowrap()
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from(details(usage))),
+                ),
         )
 }
 
@@ -224,5 +271,26 @@ mod tests {
             })),
             "5,417 / 1,048,576 tokens\n1,043,159 tokens remaining"
         );
+    }
+
+    #[test]
+    fn selected_model_replaces_the_reported_window() {
+        let reported = Some(ContextUsage {
+            tokens: Some(21_000),
+            window: Some(1_050_000),
+        });
+        let switched = for_model(reported, Some(128_000)).unwrap();
+        assert_eq!(switched.window, Some(128_000));
+        assert_eq!(switched.tokens, Some(21_000));
+        assert!(
+            details(Some(switched)).contains("128,000"),
+            "the popover must follow the selected model, not the old window"
+        );
+        assert_eq!(
+            for_model(None, Some(200_000)).unwrap().window,
+            Some(200_000)
+        );
+        assert_eq!(for_model(reported, Some(0)), reported);
+        assert_eq!(for_model(reported, None), reported);
     }
 }

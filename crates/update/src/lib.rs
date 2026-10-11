@@ -319,14 +319,29 @@ fn validate_release_override(value: &str) -> anyhow::Result<String> {
 /// updater flow exists to drive.
 pub const RELEASES_PAGE: &str = "https://github.com/zeronsh/zeron/releases";
 
+/// This fork does not follow the upstream Zeron release channel. The public
+/// edge still advertises the next upstream version, which is not an update
+/// for this build. Set `ZERON_UPSTREAM_UPDATES=1` to opt back in.
+pub fn upstream_updates_enabled() -> bool {
+    std::env::var("ZERON_UPSTREAM_UPDATES")
+        .is_ok_and(|value| matches!(value.trim(), "1" | "true" | "TRUE"))
+}
+
 /// The newest release's page — the download destination offered when this
 /// installation cannot replace itself.
 pub const LATEST_RELEASE_PAGE: &str = "https://github.com/zeronsh/zeron/releases/latest";
+
+fn releases_disabled() -> bool {
+    std::env::var("ZERON_RELEASES_URL").is_ok_and(|url| url.trim().eq_ignore_ascii_case("off"))
+}
 
 fn release_base(edge_url: &str) -> anyhow::Result<String> {
     if let Ok(url) = std::env::var("ZERON_RELEASES_URL")
         && !url.trim().is_empty()
     {
+        if url.trim().eq_ignore_ascii_case("off") {
+            bail!("application update feed disabled");
+        }
         return validate_release_override(&url);
     }
     #[cfg(windows)]
@@ -1239,6 +1254,10 @@ impl Updater {
     }
 
     fn publish(&self, manifest: Manifest) {
+        if !upstream_updates_enabled() {
+            self.status_tx.send_replace(UpdateStatus::initial());
+            return;
+        }
         let status = UpdateStatus {
             current_version: current_version().to_string(),
             update_available: version_newer(&manifest.version, current_version()),
@@ -1258,6 +1277,9 @@ impl Updater {
 
     /// One check; returns false on fetch failure (retry sooner).
     async fn check_once(&self) -> bool {
+        if releases_disabled() {
+            return true;
+        }
         match fetch_latest(&self.edge_url).await {
             Ok(manifest) => {
                 self.publish(manifest);
@@ -1413,6 +1435,32 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upstream_updates_stay_off_unless_explicitly_enabled() {
+        let previous = std::env::var("ZERON_UPSTREAM_UPDATES").ok();
+        unsafe { std::env::remove_var("ZERON_UPSTREAM_UPDATES") };
+        assert!(!upstream_updates_enabled());
+        unsafe { std::env::set_var("ZERON_UPSTREAM_UPDATES", "1") };
+        assert!(upstream_updates_enabled());
+        match previous {
+            Some(value) => unsafe { std::env::set_var("ZERON_UPSTREAM_UPDATES", value) },
+            None => unsafe { std::env::remove_var("ZERON_UPSTREAM_UPDATES") },
+        }
+    }
+
+    #[test]
+    fn off_disables_the_upstream_release_feed() {
+        let previous = std::env::var("ZERON_RELEASES_URL").ok();
+        // SAFETY: this test owns the process-global override and restores it.
+        unsafe { std::env::set_var("ZERON_RELEASES_URL", "off") };
+        assert!(releases_disabled());
+        assert!(release_base("https://edge.example").is_err());
+        match previous {
+            Some(value) => unsafe { std::env::set_var("ZERON_RELEASES_URL", value) },
+            None => unsafe { std::env::remove_var("ZERON_RELEASES_URL") },
+        }
+    }
 
     #[tokio::test]
     async fn stalled_update_headers_and_body_time_out_but_progressing_body_survives() {

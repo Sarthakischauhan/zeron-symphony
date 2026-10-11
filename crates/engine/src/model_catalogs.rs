@@ -223,6 +223,8 @@ mod tests {
             description: None,
             reasoning_levels: vec![],
             options: vec![],
+            context_limit: None,
+            provider: None,
         }]
     }
     struct Probe {

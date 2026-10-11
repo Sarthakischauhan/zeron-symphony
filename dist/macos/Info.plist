@@ -35,6 +35,11 @@
             </array>
         </dict>
     </array>
+    <key>LSEnvironment</key>
+    <dict>
+        <key>ZERON_RELEASES_URL</key>
+        <string>off</string>
+    </dict>
     <key>LSMinimumSystemVersion</key>
     <string>12.0</string>
     <key>NSHighResolutionCapable</key>
