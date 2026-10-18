@@ -14,10 +14,11 @@ that label does not provide filesystem isolation for Symphony sessions.
 
 ## Local setup
 
-1. Check out the current `main` branch from `Sarthakischauhan/symphony` on the
-   machine running the Zeron engine. Run `uv sync --all-packages` there and
-   set `SYMPHONY_EXECUTABLE` to the absolute path of `.venv/bin/symphony`.
-   Configure a model provider in Symphony and check it with
+1. Install the published Symphony package in the Python environment used by
+   the machine running the Zeron engine (for example, `python -m pip install
+   symphony-code`). Set `SYMPHONY_EXECUTABLE` to that environment's `symphony`
+   executable if it is not on Zeron's `PATH`. Configure a model provider in
+   Symphony and check it with
    `printf '{"type":"model/list","request_id":"probe"}\n' | "$SYMPHONY_EXECUTABLE" stdio`.
 2. Build this fork with `cargo build --release --locked -p zeron`.
 3. Run the built `target/release/zeron` from this branch. New sessions use
