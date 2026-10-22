@@ -152,7 +152,7 @@ jobs:
           if-no-files-found: ignore
       - uses: actions/setup-node@v4
         with:
-          node-version: 24
+          node-version: 24.22.1
       - name: Install preview fixture server
         run: npm ci --prefix edge
       - name: Project discovery, stable URLs and HMR in native WebKit
